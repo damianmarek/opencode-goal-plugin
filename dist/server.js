@@ -888,6 +888,16 @@ async function cancelGoal(sessionID, reason = "cancelled") {
     return snapshot(goal);
   });
 }
+async function cancelActiveGoal(sessionID) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID];
+    if (!goal)
+      return null;
+    if (goal.status === "active")
+      cancelGoalRecord(goal, "cancelled");
+    return snapshot(goal);
+  });
+}
 async function clearGoal(sessionID) {
   return mutate((state) => {
     const goal = state.goals[sessionID];
@@ -1937,6 +1947,27 @@ var NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/
 var NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals"]);
 var TASK_TERMINAL_STATES = new Set(["completed", "error", "cancelled"]);
 var activeContinuations = new Set;
+
+class ContinuationEpochs {
+  values = new Map;
+  current(sessionID) {
+    return this.values.get(sessionID) ?? 0;
+  }
+  invalidate(sessionID) {
+    this.values.set(sessionID, this.current(sessionID) + 1);
+  }
+}
+function isUserAbortEvent(event) {
+  const properties = event.properties;
+  if (event.type === "session.error") {
+    return isRecord(properties?.error) && properties.error.name === "MessageAbortedError";
+  }
+  const message = properties?.info;
+  return event.type === "message.updated" && isRecord(message) && message.role === "assistant" && isRecord(message.error) && message.error.name === "MessageAbortedError";
+}
+function continuationStillReserved(goal, current) {
+  return current?.id === goal.id && current.status === goal.status && (goal.status !== "active" || current.pendingAttempt?.id === goal.pendingAttempt?.id);
+}
 function restrictedAgentSet(options) {
   if (options?.allow_goal_execution_from_plan === true)
     return new Set;
@@ -2963,6 +2994,7 @@ var server = async ({ client }, options) => {
   const toolAttempts = new Map;
   const explicitResumeRequests = new Set;
   const restartAfterContinuation = new Set;
+  const continuationEpochs = new ContinuationEpochs;
   const watchdogRescuedSessions = new Set;
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
@@ -2974,6 +3006,7 @@ var server = async ({ client }, options) => {
     maxObjectiveChars: objectiveChars,
     consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
     stopAutonomy: (sessionID, mode = "stop") => {
+      continuationEpochs.invalidate(sessionID);
       cancelScheduledContinuation(sessionID);
       if (mode === "stop")
         clearTurnWatchdog(sessionID);
@@ -3027,6 +3060,8 @@ var server = async ({ client }, options) => {
     turnWatchdogs.set(sessionID, watchdog);
   }
   async function runTurnWatchdog(sessionID, watchdog) {
+    const epoch = continuationEpochs.current(sessionID);
+    const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
     let claimedContinuation = false;
     let claimedGoalID;
     try {
@@ -3062,17 +3097,23 @@ var server = async ({ client }, options) => {
       claimedContinuation = true;
       claimedGoalID = current.id;
       watchdogRescuedSessions.add(sessionID);
+      if (!isCurrent())
+        return;
       await sendContinuation(client, sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestTurnAgent ?? null);
-      await recordContinuationResult(sessionID, "success", maxPromptFailures, {
+      if (!isCurrent())
+        return;
+      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
         armNoProgress: false,
         started: true,
         expectedGoalID: claimedGoalID
       });
-      locallyDeliveredPendingSessions.add(sessionID);
-      clearTurnWatchdog(sessionID);
+      if (isCurrent() && delivered?.pendingAttempt?.delivered) {
+        locallyDeliveredPendingSessions.add(sessionID);
+        clearTurnWatchdog(sessionID);
+      }
     } catch (error) {
       try {
-        if (claimedContinuation && isTransportError(error)) {
+        if (claimedContinuation && isCurrent() && isTransportError(error)) {
           await recordContinuationResult(sessionID, "failure", maxPromptFailures, { expectedGoalID: claimedGoalID });
         }
         await client.app?.log?.({
@@ -3142,16 +3183,24 @@ var server = async ({ client }, options) => {
       return;
     if (activeContinuations.has(sessionID))
       return;
+    const epoch = continuationEpochs.current(sessionID);
+    const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
     activeContinuations.add(sessionID);
     let attemptReservedAt = Date.now();
     let attemptGoalID;
     let attemptID;
     try {
       const latestAssistant = await fetchLatestAssistant(client, sessionID);
+      if (!isCurrent())
+        return;
       taskTracker.observeAssistantMessage(sessionID, latestAssistant);
       const taskStatus = await taskBlockStatus(sessionID);
+      if (!isCurrent())
+        return;
       if (taskStatus && taskStatus.blocked) {
         const deferralGoal = await getGoalInternal(sessionID);
+        if (!isCurrent())
+          return;
         if (!taskDeferralGoalContinuable(deferralGoal)) {
           taskDeferredSessions.delete(sessionID);
           cancelScheduledContinuation(sessionID);
@@ -3161,7 +3210,7 @@ var server = async ({ client }, options) => {
         scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null || taskStatus.retryAt != null);
         return;
       }
-      if (busySessions.has(sessionID))
+      if (!isCurrent() || busySessions.has(sessionID))
         return;
       const observed = await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true);
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
@@ -3171,7 +3220,7 @@ var server = async ({ client }, options) => {
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
         return;
       const current = await getGoalInternal(sessionID);
-      if (!current)
+      if (!isCurrent() || !current)
         return;
       const latestTurnAgent = agentFromMessage(latestAssistant);
       if (isPlanAgent(current.lastPromptAgent) || isPlanAgent(latestTurnAgent)) {
@@ -3209,7 +3258,7 @@ var server = async ({ client }, options) => {
         return;
       if (!autoContinue)
         return;
-      if (nativeRetrySessions.has(sessionID))
+      if (!isCurrent() || nativeRetrySessions.has(sessionID))
         return;
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal)
@@ -3217,7 +3266,8 @@ var server = async ({ client }, options) => {
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now();
       attemptGoalID = goal.id;
       attemptID = goal.pendingAttempt?.id;
-      if (nativeRetrySessions.has(sessionID)) {
+      const beforeDelivery = await getGoalInternal(sessionID);
+      if (!isCurrent() || !continuationStillReserved(goal, beforeDelivery) || busySessions.has(sessionID) || nativeRetrySessions.has(sessionID)) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
       }
@@ -3226,19 +3276,20 @@ var server = async ({ client }, options) => {
         return;
       }
       await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal, locale) : limitPrompt(goal, locale), goal.lastPromptAgent ?? latestTurnAgent ?? null);
-      if (disposed) {
+      if (!isCurrent()) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
       }
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
         expectedGoalID: attemptGoalID
       });
-      locallyDeliveredPendingSessions.add(sessionID);
+      if (isCurrent() && delivered?.pendingAttempt?.delivered)
+        locallyDeliveredPendingSessions.add(sessionID);
       if (!delivered?.pendingAttempt?.delivered) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
       }
     } catch (error) {
-      if (disposed) {
+      if (!isCurrent()) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
       }
@@ -3503,6 +3554,17 @@ var server = async ({ client }, options) => {
     async event({ event }) {
       const sessionID = sessionIDFromEvent(event);
       const eventType = event.type;
+      if (sessionID && isUserAbortEvent(event)) {
+        explicitResumeRequests.delete(sessionID);
+        goalServices.stopAutonomy?.(sessionID);
+        busySessions.delete(sessionID);
+        nativeRetrySessions.delete(sessionID);
+        watchdogRescuedSessions.delete(sessionID);
+        clearToolAttemptsForSession(toolAttempts, sessionID);
+        taskTracker.observeSessionStatus(sessionID, "idle");
+        await cancelActiveGoal(sessionID);
+        return;
+      }
       if (eventType === "session.created") {
         taskTracker.observeSessionCreated(event);
       }
@@ -3571,6 +3633,7 @@ var server = async ({ client }, options) => {
         }
       }
       if (sessionID && eventType === "session.deleted") {
+        continuationEpochs.invalidate(sessionID);
         explicitResumeRequests.delete(sessionID);
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
@@ -3635,6 +3698,7 @@ async function setupV2(context) {
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const activeContinuationsV2 = new Set;
   const restartAfterContinuation = new Set;
+  const continuationEpochs = new ContinuationEpochs;
   const stoppedExecutions = new Set;
   const latestStepBySession = new Map;
   const stepTextBuffers = new Map;
@@ -3654,6 +3718,7 @@ async function setupV2(context) {
       }
     },
     stopAutonomy: (sessionID, mode = "stop") => {
+      continuationEpochs.invalidate(sessionID);
       cancelScheduledContinuation(sessionID);
       if (mode === "stop")
         clearTurnWatchdog(sessionID);
@@ -3712,6 +3777,8 @@ async function setupV2(context) {
     turnWatchdogs.set(sessionID, watchdog);
   }
   async function runTurnWatchdog(sessionID, watchdog) {
+    const epoch = continuationEpochs.current(sessionID);
+    const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
     let claimedContinuation = false;
     let claimedGoalID;
     try {
@@ -3743,17 +3810,23 @@ async function setupV2(context) {
       claimedContinuation = true;
       claimedGoalID = current.id;
       watchdogRescuedSessions.add(sessionID);
+      if (!isCurrent())
+        return;
       await sendContinuation2(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null);
-      await recordContinuationResult(sessionID, "success", maxPromptFailures, {
+      if (!isCurrent())
+        return;
+      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
         armNoProgress: false,
         started: true,
         expectedGoalID: claimedGoalID
       });
-      locallyDeliveredPendingSessions.add(sessionID);
-      clearTurnWatchdog(sessionID);
+      if (isCurrent() && delivered?.pendingAttempt?.delivered) {
+        locallyDeliveredPendingSessions.add(sessionID);
+        clearTurnWatchdog(sessionID);
+      }
     } catch (error) {
       try {
-        if (claimedContinuation && isTransportError(error)) {
+        if (claimedContinuation && isCurrent() && isTransportError(error)) {
           await recordContinuationResult(sessionID, "failure", maxPromptFailures, { expectedGoalID: claimedGoalID });
         }
         v2ErrorLog("Turn watchdog retry failed", error);
@@ -3818,8 +3891,10 @@ async function setupV2(context) {
       return;
     if (activeContinuationsV2.has(sessionID))
       return;
+    const epoch = continuationEpochs.current(sessionID);
+    const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
     await taskRecoveryComplete;
-    if (disposed || stoppedExecutions.has(sessionID) || busySessions.has(sessionID))
+    if (!isCurrent() || stoppedExecutions.has(sessionID) || busySessions.has(sessionID))
       return;
     activeContinuationsV2.add(sessionID);
     let attemptReservedAt = Date.now();
@@ -3833,6 +3908,8 @@ async function setupV2(context) {
       const taskStatus = taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
         const deferralGoal = await getGoalInternal(sessionID);
+        if (!isCurrent())
+          return;
         if (!taskDeferralGoalContinuable(deferralGoal)) {
           taskDeferredSessions.delete(sessionID);
           cancelScheduledContinuation(sessionID);
@@ -3864,7 +3941,7 @@ async function setupV2(context) {
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
         return;
       const current = await getGoalInternal(sessionID);
-      if (!current)
+      if (!isCurrent() || !current)
         return;
       const latestTurnAgent = latestStep?.agent;
       if (isPlanAgent(current.lastPromptAgent) || isPlanAgent(latestTurnAgent)) {
@@ -3902,7 +3979,7 @@ async function setupV2(context) {
         return;
       if (!autoContinue)
         return;
-      if (nativeRetrySessions.has(sessionID))
+      if (!isCurrent() || nativeRetrySessions.has(sessionID))
         return;
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal) {
@@ -3915,7 +3992,8 @@ async function setupV2(context) {
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now();
       attemptGoalID = goal.id;
       attemptID = goal.pendingAttempt?.id;
-      if (nativeRetrySessions.has(sessionID)) {
+      const beforeDelivery = await getGoalInternal(sessionID);
+      if (!isCurrent() || !continuationStillReserved(goal, beforeDelivery) || busySessions.has(sessionID) || nativeRetrySessions.has(sessionID)) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
       }
@@ -3924,19 +4002,20 @@ async function setupV2(context) {
         return;
       }
       await sendContinuation2(sessionID, goal.status === "active" ? continuationPrompt(goal, locale) : limitPrompt(goal, locale), goal.lastPromptAgent ?? latestTurnAgent ?? null);
-      if (disposed) {
+      if (!isCurrent()) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
       }
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
         expectedGoalID: attemptGoalID
       });
-      locallyDeliveredPendingSessions.add(sessionID);
+      if (isCurrent() && delivered?.pendingAttempt?.delivered)
+        locallyDeliveredPendingSessions.add(sessionID);
       if (!delivered?.pendingAttempt?.delivered) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
       }
     } catch (error) {
-      if (disposed) {
+      if (!isCurrent()) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
       }
@@ -4101,9 +4180,11 @@ async function setupV2(context) {
         nativeRetrySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
         watchdogRescuedSessions.delete(sessionID);
-        cancelScheduledContinuation(sessionID);
-        taskDeferredSessions.delete(sessionID);
+        goalServices.stopAutonomy?.(sessionID);
+        clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionStatus(sessionID, "idle");
+        if (data.reason === "user")
+          await cancelActiveGoal(sessionID);
         return;
       }
       case "session.execution.failed": {
@@ -4144,6 +4225,7 @@ async function setupV2(context) {
       case "session.deleted": {
         if (!sessionID)
           return;
+        continuationEpochs.invalidate(sessionID);
         explicitResumeRequests.delete(sessionID);
         stoppedExecutions.delete(sessionID);
         sessionOwnership.delete(sessionID);

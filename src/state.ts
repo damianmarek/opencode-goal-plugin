@@ -1127,6 +1127,16 @@ export async function cancelGoal(sessionID: string, reason: "cancelled" | "repla
   })
 }
 
+/** Host cancellation closes only running goals; manual turns must preserve paused and limited goals. */
+export async function cancelActiveGoal(sessionID: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal) return null
+    if (goal.status === "active") cancelGoalRecord(goal, "cancelled")
+    return snapshot(goal)
+  })
+}
+
 export async function clearGoal(sessionID: string) {
   return mutate((state) => {
     const goal = state.goals[sessionID]

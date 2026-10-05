@@ -6,6 +6,9 @@ import { z } from "zod"
 import plugin from "../src/server"
 import {
   accountUsage,
+  createGoal,
+  pauseGoalForPlanMode,
+  setGoalStatus,
   getGoal,
   getGoalInternal,
   recordContinuationResult,
@@ -77,10 +80,96 @@ beforeEach(async () => {
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
 })
 
+for (const signal of ["session.error", "message.updated"]) {
+  test(`V1 ${signal} user abort persists cancellation and prevents later continuations`, async () => {
+    const calls: unknown[] = []
+    const client = { session: { promptAsync: async (input: unknown) => { calls.push(input) } } }
+    const hooks = await setupServer({ client } as never, { min_continue_interval_seconds: 0, max_turn_time: 0.02 })
+    await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "respect cancellation" }, { sessionID: "ses_cancel" } as never)
+    await hooks.event!({ event: { type: "session.status", properties: { sessionID: "ses_cancel", status: { type: "busy" } } } } as never)
+    const error = { name: "MessageAbortedError", data: { message: "The operation was aborted." } }
+    const properties = signal === "session.error"
+      ? { sessionID: "ses_cancel", error }
+      : { info: { id: "msg_cancel", sessionID: "ses_cancel", role: "assistant", error, time: { completed: Date.now() } } }
+    await hooks.event!({ event: { type: signal, properties } } as never)
+    await hooks.event!({ event: { type: "session.status", properties: { sessionID: "ses_cancel", status: { type: "idle" } } } } as never)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(calls).toHaveLength(0)
+    expect(await getGoalInternal("ses_cancel")).toMatchObject({ status: "cancelled", pendingAttempt: null, continuationFailures: 0 })
+    const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))
+    expect(persisted.goals.ses_cancel.status).toBe("cancelled")
+    await hooks.dispose?.()
+    const reloaded = await setupServer({ client } as never, { min_continue_interval_seconds: 0 })
+    await reloaded.event!({ event: { type: "session.status", properties: { sessionID: "ses_cancel", status: { type: "busy" } } } } as never)
+    await reloaded.event!({ event: { type: "session.idle", properties: { sessionID: "ses_cancel" } } } as never)
+    expect(calls).toHaveLength(0)
+  })
+}
+
 afterEach(async () => {
   for (const dispose of serverDisposers.splice(0).reverse()) await dispose()
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
+})
+
+for (const signal of ["session.error", "message.updated"]) {
+  for (const status of ["paused", "plan", "budgetLimited", "usageLimited"] as const) {
+    test(`V1 ${signal} preserves ${status} goals when a manual turn is aborted`, async () => {
+      const calls: unknown[] = []
+      const hooks = await setupServer({ client: { session: { promptAsync: async (input: unknown) => { calls.push(input) } } } } as never)
+      const sessionID = "ses_manual_abort"
+      await createGoal(sessionID, "remain available after aborting a manual turn", { tokenBudget: status === "budgetLimited" ? 1 : null })
+      if (status === "paused") await setGoalStatus(sessionID, "paused")
+      if (status === "plan") await pauseGoalForPlanMode(sessionID)
+      if (status === "budgetLimited") await accountUsage(sessionID, 2)
+      if (status === "usageLimited") {
+        await reserveContinuation(sessionID, 1, 0)
+        await reserveContinuation(sessionID, 1, 0)
+      }
+      const before = await getGoalInternal(sessionID)
+      expect(before?.status).toBe(status === "plan" ? "paused" : status)
+      const error = { name: "MessageAbortedError" }
+      const properties = signal === "session.error" ? { sessionID, error } : { info: { sessionID, role: "assistant", error } }
+      await hooks.event!({ event: { type: signal, properties } } as never)
+      expect(await getGoalInternal(sessionID)).toEqual(before)
+      expect(calls).toHaveLength(0)
+      if (status === "paused" || status === "plan") {
+        expect((await setGoalStatus(sessionID, "active"))?.status).toBe("active")
+      }
+    })
+  }
+}
+
+test("V1 cancellation invalidates a continuation still reading the transcript", async () => {
+  let releaseTranscript: (() => void) | undefined
+  const calls: unknown[] = []
+  const hooks = await setupServer({ client: { session: {
+    messages: async () => {
+      await new Promise<void>((resolve) => { releaseTranscript = resolve })
+      return { data: [] }
+    },
+    promptAsync: async (input: unknown) => { calls.push(input) },
+  } } } as never, { min_continue_interval_seconds: 0 })
+  await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "do not restart after cancellation" }, { sessionID: "ses_cancel_read" } as never)
+  const idle = hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_cancel_read" } } } as never)
+  await waitFor(() => releaseTranscript != null)
+  await hooks.event!({ event: { type: "session.error", properties: { sessionID: "ses_cancel_read", error: { name: "MessageAbortedError" } } } } as never)
+  releaseTranscript?.()
+  await idle
+  expect(calls).toHaveLength(0)
+  expect((await getGoal("ses_cancel_read"))?.status).toBe("cancelled")
+})
+
+test("V1 only a named session abort cancels the goal", async () => {
+  const calls: unknown[] = []
+  const hooks = await setupServer({ client: { session: {
+    promptAsync: async (input: unknown) => { calls.push(input) },
+  } } } as never, { min_continue_interval_seconds: 0 })
+  await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "recover ordinary errors" }, { sessionID: "ses_non_cancel" } as never)
+  await hooks.event!({ event: { type: "session.error", properties: { sessionID: "ses_non_cancel", error: { name: "APIError", data: { message: "Upstream aborted request" } } } } } as never)
+  expect((await getGoal("ses_non_cancel"))?.status).toBe("active")
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_non_cancel" } } } as never)
+  expect(calls).toHaveLength(1)
 })
 
 test("server plugin exposes Codex-style goal tools", async () => {
