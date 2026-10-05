@@ -1764,7 +1764,7 @@ test("V2 native retry cancels the execution watchdog until execution settles", a
   await cleanup()
 })
 
-for (const reason of ["user", "shutdown", "superseded"]) {
+for (const reason of ["shutdown", "superseded"]) {
   test(`V2 execution interruption (${reason}) cancels the watchdog without continuing`, async () => {
     const mock = makeMockContext({ max_turn_time: 0.02, min_continue_interval_seconds: 0 })
     const cleanup = await setupPlugin(mock as never)
@@ -1785,6 +1785,79 @@ for (const reason of ["user", "shutdown", "superseded"]) {
     await cleanup()
   })
 }
+
+test("V2 user cancellation persists across reload and unrelated executions", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0, max_turn_time: 0.02 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "respect user cancellation")
+  await mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+  await mock.stream.push({ type: "session.execution.interrupted", created: 2, data: { sessionID: "ses_v2", reason: "user" } })
+  await mock.stream.push({ type: "session.execution.interrupted", created: 3, data: { sessionID: "ses_v2", reason: "user" } })
+  await mock.stream.push({ type: "session.idle", created: 4, data: { sessionID: "ses_v2" } })
+  expect(await getGoalInternal("ses_v2")).toMatchObject({ status: "cancelled", pendingAttempt: null, continuationFailures: 0 })
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))
+  expect(persisted.goals.ses_v2.status).toBe("cancelled")
+  expect(persisted.goals.ses_v2.history.filter((entry: { type: string }) => entry.type === "cancelled")).toHaveLength(1)
+  mock.stream.end()
+  await cleanup()
+
+  const reloaded = makeMockContext({ min_continue_interval_seconds: 0, max_turn_time: 0.02 })
+  await setupPlugin(reloaded as never)
+  await reloaded.stream.push({ type: "session.execution.started", created: 5, data: { sessionID: "ses_v2" } })
+  await reloaded.stream.push({ type: "session.execution.succeeded", created: 6, data: { sessionID: "ses_v2" } })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  expect(reloaded.promptCalls).toHaveLength(0)
+  expect((await getGoal("ses_v2"))?.status).toBe("cancelled")
+  // An explicit new goal in the same session must still work.
+  await createGoalViaV2Tool(reloaded, "a new user-requested goal")
+  await reloaded.stream.push({ type: "session.execution.succeeded", created: 7, data: { sessionID: "ses_v2" } })
+  await waitFor(() => reloaded.promptCalls.length === 1)
+  expect(reloaded.promptCalls[0]?.text).toContain("a new user-requested goal")
+})
+
+test("V2 user cancellation persists even with auto-continue disabled", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "an explicitly cancelled manual goal")
+  await mock.stream.push({ type: "session.execution.interrupted", created: 1, data: { sessionID: "ses_v2", reason: "user" } })
+  expect((await getGoal("ses_v2"))?.status).toBe("cancelled")
+  expect(mock.promptCalls).toHaveLength(0)
+})
+
+test("V2 another location's cancellation does not cancel the owner's goal", async () => {
+  await createGoal("ses_other", "a goal owned by another location")
+  const mock = makeMockContext({}, [], {}, { directory: "/own" }, {
+    ses_other: { location: { directory: "/other" } },
+  })
+  await setupPlugin(mock as never)
+  await mock.stream.push({ type: "session.execution.interrupted", created: 1, data: { sessionID: "ses_other", reason: "user" } })
+  expect((await getGoal("ses_other"))?.status).toBe("active")
+  expect(mock.promptCalls).toHaveLength(0)
+})
+
+test("V2 cancellation rejects late recovery results without affecting a replacement", async () => {
+  let rejectOldPrompt: (() => void) | undefined
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  mock.session.prompt = async (input) => {
+    mock.promptCalls.push(input)
+    if (mock.promptCalls.length !== 1) return
+    await new Promise<void>((_resolve, reject) => {
+      rejectOldPrompt = () => reject(new Error("network connection failed"))
+    })
+  }
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "the old goal")
+  // Recovery runs on a timer, allowing the host event consumer to observe Cancel.
+  await mock.stream.push({ type: "session.execution.failed", created: 1, data: { sessionID: "ses_v2", error: { message: "network connection failed" } } })
+  await waitFor(() => rejectOldPrompt != null)
+  await mock.stream.push({ type: "session.execution.interrupted", created: 2, data: { sessionID: "ses_v2", reason: "user" } })
+  expect((await getGoal("ses_v2"))?.status).toBe("cancelled")
+  await createGoalViaV2Tool(mock, "the replacement goal")
+  rejectOldPrompt?.()
+  await waitFor(() => mock.promptCalls.length === 2)
+  expect(await getGoal("ses_v2")).toMatchObject({ objective: "the replacement goal", status: "active", continuationFailures: 0, autoTurns: 1 })
+  expect(mock.promptCalls[1]?.text).toContain("the replacement goal")
+})
 
 test("V2 terminal execution transport failure recovers after native retries and respects the failure ceiling", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 0, max_prompt_failures: 1 })
