@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
-import { cancelGoal, createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
+import { accountUsage, pauseGoalForPlanMode, setGoalStatus, cancelGoal, createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
 
 const TOOL_NAMES = [
   "clear_goal",
@@ -1814,6 +1814,31 @@ test("V2 user cancellation persists across reload and unrelated executions", asy
   await waitFor(() => reloaded.promptCalls.length === 1)
   expect(reloaded.promptCalls[0]?.text).toContain("a new user-requested goal")
 })
+
+for (const status of ["paused", "plan", "budgetLimited", "usageLimited"] as const) {
+  test(`V2 preserves ${status} goals when a manual execution is cancelled`, async () => {
+    const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+    await setupPlugin(mock as never)
+    await createGoal("ses_v2", "remain available after cancelling a manual turn", { tokenBudget: status === "budgetLimited" ? 1 : null })
+    if (status === "paused") await setGoalStatus("ses_v2", "paused")
+    if (status === "plan") await pauseGoalForPlanMode("ses_v2")
+    if (status === "budgetLimited") await accountUsage("ses_v2", 2)
+    if (status === "usageLimited") {
+      await reserveContinuation("ses_v2", 1, 0)
+      await reserveContinuation("ses_v2", 1, 0)
+    }
+    const before = await getGoalInternal("ses_v2")
+    expect(before?.status).toBe(status === "plan" ? "paused" : status)
+    await mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+    await mock.stream.push({ type: "session.execution.interrupted", created: 2, data: { sessionID: "ses_v2", reason: "user" } })
+    await mock.stream.push({ type: "session.idle", created: 3, data: { sessionID: "ses_v2" } })
+    expect(await getGoalInternal("ses_v2")).toMatchObject({ id: before?.id, status: before?.status, stopReason: before?.stopReason, closedAt: null })
+    expect(mock.promptCalls).toHaveLength(0)
+    if (status === "paused" || status === "plan") {
+      expect((await setGoalStatus("ses_v2", "active"))?.status).toBe("active")
+    }
+  })
+}
 
 test("V2 user cancellation persists even with auto-continue disabled", async () => {
   const mock = makeMockContext({ auto_continue: false })

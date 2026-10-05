@@ -8,6 +8,7 @@ import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state
 import {
   accountUsage,
   cancelGoal,
+  cancelActiveGoal,
   clearGoal,
   completeGoal,
   createGoal,
@@ -2016,7 +2017,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         watchdogRescuedSessions.delete(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
         taskTracker.observeSessionStatus(sessionID, "idle")
-        await cancelGoal(sessionID)
+        await cancelActiveGoal(sessionID)
         return
       }
       if (eventType === "session.created") {
@@ -2732,7 +2733,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         goalServices.stopAutonomy?.(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
         taskTracker.observeSessionStatus(sessionID, "idle")
-        if (data.reason === "user") await cancelGoal(sessionID)
+        if (data.reason === "user") await cancelActiveGoal(sessionID)
         return
       }
       case "session.execution.failed": {

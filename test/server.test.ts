@@ -6,6 +6,9 @@ import { z } from "zod"
 import plugin from "../src/server"
 import {
   accountUsage,
+  createGoal,
+  pauseGoalForPlanMode,
+  setGoalStatus,
   getGoal,
   getGoalInternal,
   recordContinuationResult,
@@ -108,6 +111,34 @@ afterEach(async () => {
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
 })
+
+for (const signal of ["session.error", "message.updated"]) {
+  for (const status of ["paused", "plan", "budgetLimited", "usageLimited"] as const) {
+    test(`V1 ${signal} preserves ${status} goals when a manual turn is aborted`, async () => {
+      const calls: unknown[] = []
+      const hooks = await setupServer({ client: { session: { promptAsync: async (input: unknown) => { calls.push(input) } } } } as never)
+      const sessionID = "ses_manual_abort"
+      await createGoal(sessionID, "remain available after aborting a manual turn", { tokenBudget: status === "budgetLimited" ? 1 : null })
+      if (status === "paused") await setGoalStatus(sessionID, "paused")
+      if (status === "plan") await pauseGoalForPlanMode(sessionID)
+      if (status === "budgetLimited") await accountUsage(sessionID, 2)
+      if (status === "usageLimited") {
+        await reserveContinuation(sessionID, 1, 0)
+        await reserveContinuation(sessionID, 1, 0)
+      }
+      const before = await getGoalInternal(sessionID)
+      expect(before?.status).toBe(status === "plan" ? "paused" : status)
+      const error = { name: "MessageAbortedError" }
+      const properties = signal === "session.error" ? { sessionID, error } : { info: { sessionID, role: "assistant", error } }
+      await hooks.event!({ event: { type: signal, properties } } as never)
+      expect(await getGoalInternal(sessionID)).toEqual(before)
+      expect(calls).toHaveLength(0)
+      if (status === "paused" || status === "plan") {
+        expect((await setGoalStatus(sessionID, "active"))?.status).toBe("active")
+      }
+    })
+  }
+}
 
 test("V1 cancellation invalidates a continuation still reading the transcript", async () => {
   let releaseTranscript: (() => void) | undefined

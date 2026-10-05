@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import {
   accountUsage,
   cancelGoal,
+  cancelActiveGoal,
   clearGoal,
   completeGoal,
   createGoal,
@@ -84,6 +85,17 @@ test("cancels, clears, and replaces goals while preserving per-session history",
   const third = await createGoal("ses_1", "third goal", null)
   expect(third.status).toBe("active")
   expect((await getGoalHistory("ses_1")).previous).toHaveLength(2)
+})
+
+test("host cancellation observes a queued pause atomically while explicit stop can still close it", async () => {
+  await createGoal("ses_1", "preserve the pause contract", null)
+  const [, result] = await Promise.all([setGoalStatus("ses_1", "paused"), cancelActiveGoal("ses_1")])
+  expect(result?.status).toBe("paused")
+  expect((await setGoalStatus("ses_1", "active")).status).toBe("active")
+  expect((await cancelActiveGoal("ses_1"))?.status).toBe("cancelled")
+  await createGoal("ses_1", "explicit stop may close a paused goal", null)
+  await setGoalStatus("ses_1", "paused")
+  expect((await cancelGoal("ses_1"))?.status).toBe("cancelled")
 })
 
 test("closed and cancelled goals cannot be edited or closed again", async () => {

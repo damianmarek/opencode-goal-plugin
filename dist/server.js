@@ -888,6 +888,16 @@ async function cancelGoal(sessionID, reason = "cancelled") {
     return snapshot(goal);
   });
 }
+async function cancelActiveGoal(sessionID) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID];
+    if (!goal)
+      return null;
+    if (goal.status === "active")
+      cancelGoalRecord(goal, "cancelled");
+    return snapshot(goal);
+  });
+}
 async function clearGoal(sessionID) {
   return mutate((state) => {
     const goal = state.goals[sessionID];
@@ -3552,7 +3562,7 @@ var server = async ({ client }, options) => {
         watchdogRescuedSessions.delete(sessionID);
         clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionStatus(sessionID, "idle");
-        await cancelGoal(sessionID);
+        await cancelActiveGoal(sessionID);
         return;
       }
       if (eventType === "session.created") {
@@ -4174,7 +4184,7 @@ async function setupV2(context) {
         clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionStatus(sessionID, "idle");
         if (data.reason === "user")
-          await cancelGoal(sessionID);
+          await cancelActiveGoal(sessionID);
         return;
       }
       case "session.execution.failed": {
