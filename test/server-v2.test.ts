@@ -45,7 +45,7 @@ type MockCommandDraft = {
       sessionID: string
       prompt: MockPrompt
       delivery: "steer" | "queue"
-    }) => Promise<void>
+    }, execution?: { signal?: AbortSignal }) => Promise<void>
   }): void
 }
 
@@ -2441,4 +2441,86 @@ test("V2 completed tool failures do not clear retry state", async () => {
 
   mock.stream.end()
   await cleanup()
+})
+
+test("V2 command cancellation between idle cycles persists cancellation and stops the wait", async () => {
+  const mock = makeMockContext()
+  let waits = 0
+  const context = {
+    ...mock,
+    session: {
+      ...mock.session,
+      wait: async () => {
+        waits++
+      },
+    },
+  }
+  await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "Goal with idle gaps")
+  const controller = new AbortController()
+  const command = mock.commands
+    .find((command) => command.name === "goal")!
+    .execute(
+      { sessionID: "ses_v2", prompt: { text: "Goal with idle gaps" }, delivery: "steer" },
+      { signal: controller.signal },
+    )
+  await waitFor(() => waits > 0)
+  controller.abort()
+  await command
+  expect((await getGoal("ses_v2"))?.status).toBe("cancelled")
+  expect(mock.promptCalls).toHaveLength(1)
+})
+
+test("V2 wait failure pauses the goal and returns without hidden autonomous continuation", async () => {
+  const mock = makeMockContext()
+  const context = {
+    ...mock,
+    session: {
+      ...mock.session,
+      wait: async () => {
+        throw new Error("session unavailable")
+      },
+    },
+  }
+  await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "Wait failure")
+  await mock.commands
+    .find((command) => command.name === "goal")!
+    .execute({ sessionID: "ses_v2", prompt: { text: "Wait failure" }, delivery: "steer" })
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  expect(mock.promptCalls).toHaveLength(1)
+})
+
+for (const report of ["status", "show", "current"]) {
+  test(`V2 /goal ${report} returns without waiting for the active goal`, async () => {
+    const mock = makeMockContext()
+    let waits = 0
+    const context = {
+      ...mock,
+      session: {
+        ...mock.session,
+        wait: async () => {
+          waits++
+        },
+      },
+    }
+    await setupPlugin(context as never)
+    await createGoalViaV2Tool(mock, "Original full goal")
+    await mock.commands
+      .find((command) => command.name === "goal")!
+      .execute({ sessionID: "ses_v2", prompt: { text: report }, delivery: "steer" })
+    expect(waits).toBe(0)
+  })
+}
+
+test("V2 a stopped event stream pauses a waiting goal rather than polling forever", async () => {
+  const mock = makeMockContext()
+  const context = { ...mock, session: { ...mock.session, wait: async () => {} } }
+  await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "Goal with event delivery")
+  mock.stream.end()
+  await mock.commands
+    .find((command) => command.name === "goal")!
+    .execute({ sessionID: "ses_v2", prompt: { text: "Continue the goal" }, delivery: "steer" })
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
 })
