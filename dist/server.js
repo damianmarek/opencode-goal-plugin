@@ -4420,12 +4420,10 @@ async function setupV2(context) {
             const pursue = command.action === "resume" || command.action === "goal" && args !== "" && !controlOnly;
             const signal = execution?.signal ? AbortSignal.any([abortController.signal, execution.signal]) : abortController.signal;
             let admitted = false;
-            let cancellation;
             const cancel = () => {
               if (!pursue || disposed)
                 return;
               goalServices.stopAutonomy?.(input.sessionID);
-              cancellation = cancelActiveGoal(input.sessionID).catch((error) => v2ErrorLog("Failed to persist command cancellation", error));
             };
             execution?.signal?.addEventListener("abort", cancel, { once: true });
             try {
@@ -4470,7 +4468,6 @@ async function setupV2(context) {
               }
             } finally {
               execution?.signal?.removeEventListener("abort", cancel);
-              await cancellation;
             }
           }
         });
@@ -4503,6 +4500,18 @@ async function setupV2(context) {
       }
     }));
   }
+  try {
+    const hookInterrupt = context.session.hook;
+    registrations.push(await hookInterrupt("interrupt", async ({ sessionID }) => {
+      markSessionOwnership(sessionID, true);
+      goalServices.stopAutonomy?.(sessionID);
+      try {
+        await cancelActiveGoal(sessionID);
+      } catch (error) {
+        v2ErrorLog("Failed to persist explicit session cancellation", error);
+      }
+    }));
+  } catch {}
   registrations.push(await context.tool.transform((draft) => {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
