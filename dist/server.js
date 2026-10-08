@@ -6,7 +6,7 @@ import { z } from "zod";
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
 import { dirname as dirname2 } from "path";
-import { Data, Effect, Schema } from "effect";
+import { Data, Effect, Schema } from "effect-goal-state";
 
 // src/atomic-write.ts
 import { randomUUID } from "crypto";
@@ -3744,6 +3744,7 @@ async function setupV2(context) {
   };
   const registrations = [];
   let disposed = false;
+  let eventConsumerStopped = false;
   function stepKey(sessionID, messageID2) {
     return `${sessionID}\x00${messageID2}`;
   }
@@ -4391,7 +4392,7 @@ async function setupV2(context) {
         draft.add({
           name: command.name,
           description: command.description,
-          execute: async (input) => {
+          execute: async (input, execution) => {
             markSessionOwnership(input.sessionID, true);
             if (command.action === "pause") {
               const goal = await getGoal(input.sessionID);
@@ -4414,12 +4415,63 @@ async function setupV2(context) {
                 ...skills ? { skills: skills.map(stripMention) } : {}
               };
             }
-            await context.session.prompt({
-              ...forwardedPrompt,
-              sessionID: input.sessionID,
-              text: command.template.replaceAll("$ARGUMENTS", () => escapeXmlText2(input.prompt.text.trim())),
-              delivery: input.delivery
-            });
+            const args = input.prompt.text.trim().toLowerCase();
+            const controlOnly = /^(history|status|show|current|pause|stop|cancel|clear|off|reset|none|edit)(?:\s|$)/.test(args);
+            const pursue = command.action === "resume" || command.action === "goal" && args !== "" && !controlOnly;
+            const signal = execution?.signal ? AbortSignal.any([abortController.signal, execution.signal]) : abortController.signal;
+            let admitted = false;
+            let cancellation;
+            const cancel = () => {
+              if (!pursue || disposed)
+                return;
+              goalServices.stopAutonomy?.(input.sessionID);
+              cancellation = cancelActiveGoal(input.sessionID).catch((error) => v2ErrorLog("Failed to persist command cancellation", error));
+            };
+            execution?.signal?.addEventListener("abort", cancel, { once: true });
+            try {
+              if (execution?.signal?.aborted) {
+                cancel();
+                return;
+              }
+              await context.session.prompt({
+                ...forwardedPrompt,
+                sessionID: input.sessionID,
+                text: command.template.replaceAll("$ARGUMENTS", () => escapeXmlText2(input.prompt.text.trim())),
+                delivery: input.delivery
+              });
+              admitted = true;
+              if (pursue && typeof context.session.wait === "function") {
+                let pursuedGoalID;
+                do {
+                  await context.session.wait({ sessionID: input.sessionID }, { signal });
+                  if (eventConsumerStopped)
+                    throw new Error("goal event stream stopped");
+                  const goal = await getGoal(input.sessionID);
+                  if (signal.aborted || disposed || stoppedExecutions.has(input.sessionID) || !autoContinue || goal?.status !== "active")
+                    break;
+                  pursuedGoalID ??= goal.id;
+                  if (goal.id !== pursuedGoalID)
+                    break;
+                  await new Promise((resolve) => setTimeout(resolve, 250));
+                } while (!disposed && !signal.aborted);
+              }
+            } catch (error) {
+              if (!admitted && !disposed && !execution?.signal?.aborted)
+                throw error;
+              if (!disposed && !execution?.signal?.aborted) {
+                goalServices.stopAutonomy?.(input.sessionID);
+                v2ErrorLog("Goal command wait failed; autonomous continuation stopped", error);
+                try {
+                  if ((await getGoal(input.sessionID))?.status === "active")
+                    await setGoalStatus(input.sessionID, "paused");
+                } catch (stateError) {
+                  v2ErrorLog("Failed to pause goal after command failure", stateError);
+                }
+              }
+            } finally {
+              execution?.signal?.removeEventListener("abort", cancel);
+              await cancellation;
+            }
           }
         });
       }
@@ -4552,6 +4604,9 @@ async function setupV2(context) {
     } catch (error) {
       if (!abortController.signal.aborted)
         v2ErrorLog("V2 event consumer stopped", error);
+    } finally {
+      if (!disposed && !abortController.signal.aborted)
+        eventConsumerStopped = true;
     }
   })();
   return async () => {

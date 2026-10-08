@@ -2211,6 +2211,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
   const registrations: Array<{ dispose(): Promise<void> }> = []
   let disposed = false
+  let eventConsumerStopped = false
 
   function stepKey(sessionID: string, messageID: string) {
     return `${sessionID}\0${messageID}`
@@ -2935,7 +2936,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           draft.add({
             name: command.name,
             description: command.description,
-            execute: async (input) => {
+            execute: async (input, execution?: { signal?: AbortSignal }) => {
               // Command execution is routed to the session's owning location.
               markSessionOwnership(input.sessionID, true)
               if (command.action === "pause") {
@@ -2961,12 +2962,70 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                   ...(skills ? { skills: skills.map(stripMention) } : {}),
                 }
               }
-              await context.session.prompt({
-                ...forwardedPrompt,
-                sessionID: input.sessionID,
-                text: command.template.replaceAll("$ARGUMENTS", () => escapeXmlText(input.prompt.text.trim())),
-                delivery: input.delivery,
-              })
+              const args = input.prompt.text.trim().toLowerCase()
+              const controlOnly = /^(history|status|show|current|pause|stop|cancel|clear|off|reset|none|edit)(?:\s|$)/.test(args)
+              const pursue = command.action === "resume" || (command.action === "goal" && args !== "" && !controlOnly)
+              const signal = execution?.signal
+                ? AbortSignal.any([abortController.signal, execution.signal])
+                : abortController.signal
+              let admitted = false
+              let cancellation: Promise<unknown> | undefined
+              const cancel = () => {
+                if (!pursue || disposed) return
+                goalServices.stopAutonomy?.(input.sessionID)
+                cancellation = cancelActiveGoal(input.sessionID).catch((error) =>
+                  v2ErrorLog("Failed to persist command cancellation", error),
+                )
+              }
+              execution?.signal?.addEventListener("abort", cancel, { once: true })
+              try {
+                if (execution?.signal?.aborted) {
+                  cancel()
+                  return
+                }
+                await context.session.prompt({
+                  ...forwardedPrompt,
+                  sessionID: input.sessionID,
+                  text: command.template.replaceAll("$ARGUMENTS", () => escapeXmlText(input.prompt.text.trim())),
+                  delivery: input.delivery,
+                })
+                admitted = true
+                // A goal command owns all its automatic execution cycles.
+                // Older hosts without wait retain admission-only behavior.
+                if (pursue && typeof context.session.wait === "function") {
+                  let pursuedGoalID: string | undefined
+                  do {
+                    await context.session.wait({ sessionID: input.sessionID }, { signal })
+                    if (eventConsumerStopped) throw new Error("goal event stream stopped")
+                    const goal = await getGoal(input.sessionID)
+                    if (
+                      signal.aborted ||
+                      disposed ||
+                      stoppedExecutions.has(input.sessionID) ||
+                      !autoContinue ||
+                      goal?.status !== "active"
+                    )
+                      break
+                    pursuedGoalID ??= goal.id
+                    if (goal.id !== pursuedGoalID) break
+                    await new Promise((resolve) => setTimeout(resolve, 250))
+                  } while (!disposed && !signal.aborted)
+                }
+              } catch (error) {
+                if (!admitted && !disposed && !execution?.signal?.aborted) throw error
+                if (!disposed && !execution?.signal?.aborted) {
+                  goalServices.stopAutonomy?.(input.sessionID)
+                  v2ErrorLog("Goal command wait failed; autonomous continuation stopped", error)
+                  try {
+                    if ((await getGoal(input.sessionID))?.status === "active") await setGoalStatus(input.sessionID, "paused")
+                  } catch (stateError) {
+                    v2ErrorLog("Failed to pause goal after command failure", stateError)
+                  }
+                }
+              } finally {
+                execution?.signal?.removeEventListener("abort", cancel)
+                await cancellation
+              }
             },
           })
         }
@@ -3139,6 +3198,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
     } catch (error) {
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)
+    } finally {
+      if (!disposed && !abortController.signal.aborted) eventConsumerStopped = true
     }
   })()
 
