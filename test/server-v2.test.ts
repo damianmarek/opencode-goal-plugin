@@ -339,6 +339,23 @@ test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and
   expect(mock.promptCalls).toHaveLength(0)
 })
 
+test("V2 update_goal_plan exposes a provider-compatible JSON Schema instead of Zod internals", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  const input = goalTool(mock, "update_goal_plan").input as {
+    properties: Record<string, unknown>
+    required: string[]
+  }
+
+  expect(input.required).toEqual(["goal_id", "expected_revision", "plan", "reason", "revisit_evidence"])
+  expect(input.properties.revisit_evidence).toMatchObject({ type: ["string", "null"] })
+  expect(JSON.stringify(input)).not.toContain('"optional"')
+
+  const plan = input.properties.plan as { properties: Record<string, unknown>; required: string[] }
+  expect(plan.required).toEqual(["summary", "completionCriteria", "phases", "decisions"])
+  expect(plan.properties.decisions).toMatchObject({ type: ["array", "null"] })
+})
+
 test("V2 stop, replace, clear, and history tools preserve prior goals", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)

@@ -1060,7 +1060,14 @@ const planToolArgs = {
 const PlanToolSchema = z.object(planToolArgs).strict()
 
 async function planFromTool(args: unknown, context: ToolExecContext) {
-  const input = PlanToolSchema.parse(args)
+  const inputArgs = isRecord(args) ? { ...args } : args
+  if (isRecord(inputArgs)) {
+    if (inputArgs.revisit_evidence === null) inputArgs.revisit_evidence = undefined
+    if (isRecord(inputArgs.plan) && inputArgs.plan.decisions === null) {
+      inputArgs.plan = { ...inputArgs.plan, decisions: [] }
+    }
+  }
+  const input = PlanToolSchema.parse(inputArgs)
   return JSON.stringify(
     {
       goal: await updateGoalPlan(context.sessionID, {
@@ -1344,6 +1351,58 @@ function v2ObjectSchema(properties: Record<string, unknown>, required: string[] 
     required,
     additionalProperties: false,
   } as ToolSchema.ValueSchema
+}
+
+function v2PlanToolSchema(): ToolSchema.ValueSchema {
+  const text = { type: "string", minLength: 1, maxLength: 2000, pattern: "\\S" }
+  const id = { type: "string", pattern: "^[a-zA-Z0-9_-]{1,80}$" }
+  const status = { type: "string", enum: ["pending", "in_progress", "completed", "blocked"] }
+  const task = {
+    type: "object",
+    properties: {
+      id,
+      description: text,
+      status,
+      evidence: { type: ["string", "null"], minLength: 1, maxLength: 2000, pattern: "\\S" },
+      blocker: { type: ["string", "null"], minLength: 1, maxLength: 2000, pattern: "\\S" },
+    },
+    required: ["id", "description", "status", "evidence", "blocker"],
+    additionalProperties: false,
+  }
+  const phase = {
+    type: "object",
+    properties: {
+      id,
+      objective: text,
+      status,
+      tasks: { type: "array", minItems: 1, maxItems: 128, items: task },
+      verification: { type: ["string", "null"], minLength: 1, maxLength: 2000, pattern: "\\S" },
+      blocker: { type: ["string", "null"], minLength: 1, maxLength: 2000, pattern: "\\S" },
+    },
+    required: ["id", "objective", "status", "tasks", "verification", "blocker"],
+    additionalProperties: false,
+  }
+
+  return v2ObjectSchema(
+    {
+      goal_id: { type: "string", minLength: 1 },
+      expected_revision: { type: "integer", minimum: 0 },
+      plan: {
+        type: "object",
+        properties: {
+          summary: text,
+          completionCriteria: { type: "array", minItems: 1, maxItems: 32, items: text },
+          phases: { type: "array", minItems: 1, maxItems: 64, items: phase },
+          decisions: { type: ["array", "null"], maxItems: 32, items: text },
+        },
+        required: ["summary", "completionCriteria", "phases", "decisions"],
+        additionalProperties: false,
+      },
+      reason: text,
+      revisit_evidence: { type: ["string", "null"], minLength: 1, maxLength: 2000, pattern: "\\S" },
+    },
+    ["goal_id", "expected_revision", "plan", "reason", "revisit_evidence"],
+  )
 }
 
 type V2EventLike = {
@@ -3356,7 +3415,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
     {
       name: "update_goal_plan",
       description: services.locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
-      input: v2ObjectSchema(planToolArgs),
+      input: v2PlanToolSchema(),
       options: { codemode: false },
       execute: async (args, context) => ({ content: await planFromTool(args, context) }),
     },
