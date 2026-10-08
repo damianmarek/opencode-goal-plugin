@@ -1286,11 +1286,12 @@ async function updateGoalObjectiveFromTool(
 ) {
   const requested = input.status ?? "active"
   const planningOnly = requested === "active" && services.isPlanAgent(context.agent)
-  const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested, {
+  const edit = services.consumeObjectiveEdit?.(context.sessionID, input.objective)
+  const goal = await updateGoalObjective(context.sessionID, edit?.objective ?? input.objective, planningOnly ? "paused" : requested, {
     agent: typeof context.agent === "string" ? context.agent : null,
     planModePause: planningOnly,
     maxObjectiveChars: services.maxObjectiveChars,
-    requestedPlanEdit: services.consumeObjectiveEdit?.(context.sessionID, input.objective),
+    requestedPlanEdit: edit,
   })
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: services.messages.notices.planModeCreate } : { goal }, null, 2)
 }
@@ -1456,7 +1457,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
     consumeObjectiveEdit: (sessionID, objective) => {
       const edit = objectiveEdits.get(sessionID)
-      if (edit?.objective !== objective.trim()) return
+      if (!edit || (edit.objective !== objective.trim() && escapeXmlText(edit.objective) !== objective.trim())) return
       objectiveEdits.delete(sessionID)
       return edit
     },
@@ -2285,7 +2286,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
     consumeObjectiveEdit: (sessionID, objective) => {
       const edit = objectiveEdits.get(sessionID)
-      if (edit?.objective !== objective.trim()) return
+      if (!edit || (edit.objective !== objective.trim() && escapeXmlText(edit.objective) !== objective.trim())) return
       objectiveEdits.delete(sessionID)
       return edit
     },

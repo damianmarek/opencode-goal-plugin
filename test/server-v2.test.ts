@@ -2567,12 +2567,12 @@ test("V2 planned scope edits need a matching explicit command and consume the gr
   ).rejects.toThrow("/goal edit")
   await mock.commands
     .find((command) => command.name === "goal")!
-    .execute({ sessionID: "ses_v2", prompt: { text: "edit New user scope" }, delivery: "steer" })
+    .execute({ sessionID: "ses_v2", prompt: { text: "edit New user scope & <checks>" }, delivery: "steer" })
   await expect(
     goalTool(mock, "update_goal_objective").execute({ objective: "Different unrequested scope" }, toolContext()),
   ).rejects.toThrow("/goal edit")
-  await goalTool(mock, "update_goal_objective").execute({ objective: "New user scope" }, toolContext())
-  expect(await getGoal("ses_v2")).toMatchObject({ objective: "New user scope", plan: null, planRevision: 2 })
+  await goalTool(mock, "update_goal_objective").execute({ objective: "New user scope &amp; &lt;checks&gt;" }, toolContext())
+  expect(await getGoal("ses_v2")).toMatchObject({ objective: "New user scope & <checks>", plan: null, planRevision: 2 })
   await goalTool(mock, "update_goal_plan").execute(
     { goal_id: goal.id, expected_revision: 2, plan, reason: "Plan the new scope" },
     toolContext(),

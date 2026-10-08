@@ -4235,8 +4235,8 @@ test("V1 only a sanitized explicit goal edit authorizes clearing a saved plan", 
   await expect(requireTool(hooks.tool?.update_goal_objective,"update_goal_objective").execute({objective:"Only parser"},context)).rejects.toThrow("/goal edit")
   const config={} as {command?:Record<string,{template:string}>}
   await hooks.config?.(config as never)
-  const args="edit New user scope"
+  const args="edit New user scope & <checks>"
   await hooks["command.execute.before"]?.({command:"goal",sessionID:"ses_edit",arguments:args},{parts:[{type:"text",text:config.command!.goal!.template.replaceAll("$ARGUMENTS",args)}]} as never)
-  await requireTool(hooks.tool?.update_goal_objective,"update_goal_objective").execute({objective:"New user scope"},context)
-  expect(await getGoal("ses_edit")).toMatchObject({objective:"New user scope",plan:null,planRevision:2})
+  await requireTool(hooks.tool?.update_goal_objective,"update_goal_objective").execute({objective:"New user scope &amp; &lt;checks&gt;"},context)
+  expect(await getGoal("ses_edit")).toMatchObject({objective:"New user scope & <checks>",plan:null,planRevision:2})
 })
