@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
-import { accountUsage, pauseGoalForPlanMode, setGoalStatus, cancelGoal, createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
+import { accountUsage, pauseGoalForPlanMode, setGoalStatus, cancelGoal, completeGoal, createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
 
 const TOOL_NAMES = [
   "clear_goal",
@@ -483,6 +483,142 @@ test("V2 create_goal reuses the same active objective without reinitializing sta
 
   mock.stream.end()
   await cleanup()
+})
+
+test("V2 /goal waits across execution cycles and resolves when the overall goal closes", async () => {
+  const mock = makeMockContext()
+  let waits = 0
+  let finish: (() => void) | undefined
+  const context = {
+    ...mock,
+    session: {
+      ...mock.session,
+      wait: async () => {
+        waits++
+        if (waits > 1)
+          await new Promise<void>((resolve) => {
+            finish = resolve
+          })
+      },
+    },
+  }
+  await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "finish the entire goal")
+  let returned = false
+  const command = mock.commands
+    .find((command) => command.name === "goal")!
+    .execute({ sessionID: "ses_v2", prompt: { text: "finish the entire goal" }, delivery: "steer" })
+    .then(() => {
+      returned = true
+    })
+  await waitFor(() => waits === 2)
+  expect(returned).toBe(false)
+  await completeGoal("ses_v2", "All requested deliverables were verified")
+  finish?.()
+  await command
+  expect(returned).toBe(true)
+})
+
+test("V2 cancellation releases a waiting goal command without restarting the goal", async () => {
+  const mock = makeMockContext()
+  let finish: (() => void) | undefined
+  const context = {
+    ...mock,
+    session: {
+      ...mock.session,
+      wait: async () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        }),
+    },
+  }
+  await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "respect Cancel during a long-running command")
+  const command = mock.commands
+    .find((command) => command.name === "goal")!
+    .execute({ sessionID: "ses_v2", prompt: { text: "respect Cancel" }, delivery: "steer" })
+  await waitFor(() => finish !== undefined)
+  await mock.stream.push({
+    type: "session.execution.interrupted",
+    created: 1,
+    data: { sessionID: "ses_v2", reason: "user" },
+  })
+  finish?.()
+  await command
+  expect((await getGoal("ses_v2"))?.status).toBe("cancelled")
+  expect(mock.promptCalls).toHaveLength(1)
+})
+
+test("V2 disposal aborts a pending command wait", async () => {
+  const mock = makeMockContext()
+  let waiting = false
+  const context = {
+    ...mock,
+    session: {
+      ...mock.session,
+      wait: async (_input: unknown, options: { signal: AbortSignal }) =>
+        new Promise<void>((_resolve, reject) => {
+          waiting = true
+          options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+        }),
+    },
+  }
+  const cleanup = await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "stop when the plugin is disposed")
+  const command = mock.commands
+    .find((command) => command.name === "goal")!
+    .execute({ sessionID: "ses_v2", prompt: { text: "Verify cleanup on disposal" }, delivery: "steer" })
+  await waitFor(() => waiting)
+  await cleanup()
+  await command
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
+})
+
+test("V2 command wait ends if the pursued goal is replaced", async () => {
+  const mock = makeMockContext()
+  let waits = 0
+  const context = {
+    ...mock,
+    session: {
+      ...mock.session,
+      wait: async () => {
+        waits++
+        if (waits === 2) await goalTool(mock, "replace_goal").execute({ objective: "A separate goal" }, toolContext())
+      },
+    },
+  }
+  await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "Original goal")
+  await mock.commands
+    .find((command) => command.name === "goal")!
+    .execute({ sessionID: "ses_v2", prompt: { text: "Original goal" }, delivery: "steer" })
+  expect(waits).toBe(2)
+  expect((await getGoal("ses_v2"))?.objective).toBe("A separate goal")
+})
+
+test("V2 control commands and disabled auto-continuation return after their execution", async () => {
+  for (const [text, autoContinue] of [
+    ["history", true],
+    ["Original goal", false],
+  ] as const) {
+    const mock = makeMockContext({ auto_continue: autoContinue })
+    let waits = 0
+    const context = {
+      ...mock,
+      session: {
+        ...mock.session,
+        wait: async () => {
+          waits++
+        },
+      },
+    }
+    await setupPlugin(context as never)
+    await createGoalViaV2Tool(mock, "Original goal")
+    await mock.commands
+      .find((command) => command.name === "goal")!
+      .execute({ sessionID: "ses_v2", prompt: { text }, delivery: "steer" })
+    expect(waits).toBe(text === "history" ? 0 : 1)
+  }
 })
 
 test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {

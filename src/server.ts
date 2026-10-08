@@ -2967,6 +2967,26 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                 text: command.template.replaceAll("$ARGUMENTS", () => escapeXmlText(input.prompt.text.trim())),
                 delivery: input.delivery,
               })
+              // The admitted prompt is not the end of a long-running goal command.
+              // Older hosts without the wait API retain their admission-only behavior.
+              const args = input.prompt.text.trim().toLowerCase()
+              const controlOnly = /^(history|pause|stop|cancel|clear|off|reset|none|edit)(?:\s|$)/.test(args)
+              const pursue = command.action === "resume" || (command.action === "goal" && args !== "" && !controlOnly)
+              if (pursue && typeof context.session.wait === "function") {
+                try {
+                  let pursuedGoalID: string | undefined
+                  do {
+                    await context.session.wait({ sessionID: input.sessionID }, { signal: abortController.signal })
+                    const goal = await getGoal(input.sessionID)
+                    if (disposed || stoppedExecutions.has(input.sessionID) || !autoContinue || goal?.status !== "active") break
+                    pursuedGoalID ??= goal.id
+                    if (goal.id !== pursuedGoalID) break
+                    await new Promise((resolve) => setTimeout(resolve, 250))
+                  } while (!disposed)
+                } catch (error) {
+                  if (!disposed) throw error
+                }
+              }
             },
           })
         }

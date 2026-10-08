@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { mkdir, readFile } from "node:fs/promises"
 import { dirname } from "node:path"
-import { Data, Effect, Schema } from "effect"
+import { Data, Effect, Schema } from "effect-goal-state"
 import { atomicWriteFile } from "./atomic-write"
 import { statePath } from "./state-path"
 

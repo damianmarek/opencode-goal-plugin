@@ -6,7 +6,7 @@
       "name": "opencode-goal-plugin",
       "dependencies": {
         "@opencode-ai/plugin": "^1.17.1",
-        "effect": "^3.21.2",
+        "effect-goal-state": "npm:effect@^3.21.2",
         "zod": "^4.1.8",
       },
       "devDependencies": {
@@ -485,6 +485,8 @@
     "ecdsa-sig-formatter": ["ecdsa-sig-formatter@1.0.11", "https://registry.npmjs.org/ecdsa-sig-formatter/-/ecdsa-sig-formatter-1.0.11.tgz", { "dependencies": { "safe-buffer": "^5.0.1" } }, "sha512-nagl3RYrbNv6kQkeJIpt6NJZy8twLB/2vtz6yN9Z4vRKHN4/QZJIEbqohALSgwKdnksuY3k5Addp5lg8sVoVcQ=="],
 
     "effect": ["effect@3.21.2", "https://registry.npmjs.org/effect/-/effect-3.21.2.tgz", { "dependencies": { "@standard-schema/spec": "^1.0.0", "fast-check": "^3.23.1" } }, "sha512-rXd2FGDM8KdjSIrc+mqEELo7ScW7xTVxEf1iInmPSpIde9/nyGuFM710cjTo7/EreGXiUX2MOonPpprbz2XHCg=="],
+
+    "effect-goal-state": ["effect@3.21.2", "", { "dependencies": { "@standard-schema/spec": "^1.0.0", "fast-check": "^3.23.1" } }, "sha512-rXd2FGDM8KdjSIrc+mqEELo7ScW7xTVxEf1iInmPSpIde9/nyGuFM710cjTo7/EreGXiUX2MOonPpprbz2XHCg=="],
 
     "electron-to-chromium": ["electron-to-chromium@1.5.349", "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.349.tgz", {}, "sha512-QsWVGyRuY07Aqb234QytTfwd5d9AJlfNIQ5wIOl1L+PZDzI9d9+Fn0FRale/QYlFxt/bUnB0/nLd1jFPGxGK1A=="],
 

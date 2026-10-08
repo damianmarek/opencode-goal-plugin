@@ -6,7 +6,7 @@ import { z } from "zod";
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
 import { dirname as dirname2 } from "path";
-import { Data, Effect, Schema } from "effect";
+import { Data, Effect, Schema } from "effect-goal-state";
 
 // src/atomic-write.ts
 import { randomUUID } from "crypto";
@@ -4420,6 +4420,27 @@ async function setupV2(context) {
               text: command.template.replaceAll("$ARGUMENTS", () => escapeXmlText2(input.prompt.text.trim())),
               delivery: input.delivery
             });
+            const args = input.prompt.text.trim().toLowerCase();
+            const controlOnly = /^(history|pause|stop|cancel|clear|off|reset|none|edit)(?:\s|$)/.test(args);
+            const pursue = command.action === "resume" || command.action === "goal" && args !== "" && !controlOnly;
+            if (pursue && typeof context.session.wait === "function") {
+              try {
+                let pursuedGoalID;
+                do {
+                  await context.session.wait({ sessionID: input.sessionID }, { signal: abortController.signal });
+                  const goal = await getGoal(input.sessionID);
+                  if (disposed || stoppedExecutions.has(input.sessionID) || !autoContinue || goal?.status !== "active")
+                    break;
+                  pursuedGoalID ??= goal.id;
+                  if (goal.id !== pursuedGoalID)
+                    break;
+                  await new Promise((resolve) => setTimeout(resolve, 250));
+                } while (!disposed);
+              } catch (error) {
+                if (!disposed)
+                  throw error;
+              }
+            }
           }
         });
       }
