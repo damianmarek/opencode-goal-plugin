@@ -107,7 +107,7 @@ test("closed and cancelled goals cannot be edited or closed again", async () => 
   expect(await getGoal("ses_1")).toMatchObject({ objective: "do not reopen", status: "cancelled" })
 })
 
-test("archives compact goal state and writes version 2 after migrating version 1", async () => {
+test("archives compact goal state and writes version 3 after migrating version 1", async () => {
   await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, JSON.stringify({ version: 1, goals: {} }), "utf8")
   await createGoal("ses_1", "x".repeat(3_000), null)
   await recordAssistantProgress("ses_1", { messageID: "message", text: "y".repeat(10_000), outputTokens: 100 })
@@ -118,7 +118,7 @@ test("archives compact goal state and writes version 2 after migrating version 1
     version: number
     archives: Record<string, Array<Record<string, unknown>>>
   }
-  expect(persisted.version).toBe(2)
+  expect(persisted.version).toBe(3)
   expect(String(persisted.archives.ses_1?.[0]?.objective).length).toBeLessThanOrEqual(2_000)
   expect(String(persisted.archives.ses_1?.[0]?.completionEvidence).length).toBeLessThanOrEqual(2_000)
   expect(persisted.archives.ses_1?.[0]).not.toHaveProperty("lastAssistantText")
@@ -155,7 +155,7 @@ test("reads and updates planless version 3 state without downgrading or losing m
   expect(JSON.parse(await readFile(file, "utf8")).version).toBe(3)
 })
 
-test("does not reinterpret populated planning state or unknown future state versions", async () => {
+test("rejects malformed plans and unknown future state versions without rewriting them", async () => {
   await createGoal("ses_1", "preserve planning state", null)
   const file = process.env.OPENCODE_GOAL_STATE_PATH!
   const original = JSON.parse(await readFile(file, "utf8"))
@@ -730,7 +730,7 @@ test("creates and persists a goal from an empty state file", async () => {
   expect(created.objective).toBe("recover safely")
   expect((await getGoal("ses_1"))?.objective).toBe("recover safely")
   expect(JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))).toMatchObject({
-    version: 2,
+    version: 3,
     goals: { ses_1: { objective: "recover safely" } },
   })
   expect((await readdir(dir)).filter((name) => name.includes(".corrupt-"))).toEqual([])

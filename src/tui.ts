@@ -423,8 +423,6 @@ export async function readPersistedGoal(sessionID: string): Promise<GoalSnapshot
     const stored = state.goals[sessionID]
     if (stored === undefined) return null
     if (!isRecord(stored) || stored.sessionID !== sessionID) return undefined
-    if (stored.plan !== undefined && stored.plan !== null) return undefined
-    if (stored.planRevision !== undefined && stored.planRevision !== 0) return undefined
     const sampledAt = currentEpochSeconds()
     const timeUsedSeconds = typeof stored.timeUsedSeconds === "number" ? stored.timeUsedSeconds : 0
     const activeSeconds = stored.status === "active" && typeof stored.lastAccountedAt === "number"

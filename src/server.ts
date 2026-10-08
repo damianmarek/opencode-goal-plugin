@@ -4,6 +4,7 @@ import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
 import type { SessionMessageInfo } from "@opencode/client"
 import { z } from "zod"
+import { GoalPlanInputSchema, goalPlanEntries } from "./goal-plan"
 import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
   accountUsage,
@@ -33,6 +34,7 @@ import {
   resolveMaxObjectiveChars,
   statePath,
   updateGoalObjective,
+  updateGoalPlan,
   validateEvidence,
   validateObjective,
 } from "./state"
@@ -1048,6 +1050,73 @@ function mergeSystemReminder(output: { system: string[] }, reminder: string) {
   output.system[0] = `${output.system[0]}\n\n${reminder}`
 }
 
+const planToolArgs = {
+  goal_id: z.string().min(1),
+  expected_revision: z.number().int().nonnegative(),
+  plan: GoalPlanInputSchema,
+  reason: z.string().trim().min(1).max(2000),
+  revisit_evidence: z.string().trim().min(1).max(2000).optional(),
+}
+const PlanToolSchema = z.object(planToolArgs).strict()
+
+async function planFromTool(args: unknown, context: ToolExecContext) {
+  const input = PlanToolSchema.parse(args)
+  return JSON.stringify(
+    {
+      goal: await updateGoalPlan(context.sessionID, {
+        goalID: input.goal_id,
+        expectedRevision: input.expected_revision,
+        plan: input.plan,
+        reason: input.reason,
+        revisitEvidence: input.revisit_evidence,
+      }),
+    },
+    null,
+    2,
+  )
+}
+
+function acpPlanMetadata(goal: GoalSnapshot | null) {
+  return {
+    acp: {
+      plan: {
+        entries: goal?.plan
+          ? goalPlanEntries(goal.plan).map((entry) => ({
+              ...entry,
+              status: goal.status !== "active" && entry.status === "in_progress" ? "pending" : entry.status,
+            }))
+          : [],
+        _meta: {
+          "opencode-goal": goal
+            ? {
+                id: goal.id,
+                objective: goal.objective,
+                status: goal.status,
+                plan: goal.plan,
+                progress: goal.planProgress,
+                blocker: goal.blocker,
+                completionEvidence: goal.completionEvidence,
+              }
+            : null,
+        },
+      },
+    },
+  }
+}
+
+const GOAL_PLAN_TOOLS = new Set([
+  "get_goal",
+  "create_goal",
+  "set_goal",
+  "update_goal",
+  "update_goal_plan",
+  "update_goal_status",
+  "update_goal_objective",
+  "stop_goal",
+  "replace_goal",
+  "clear_goal",
+])
+
 function getGoalToolResult(goal: GoalSnapshot | null, messages: GoalMessages = messagesFor("en")) {
   const result: { goal: GoalSnapshot | null; goal_mode_notice?: string } = { goal }
   if (goal?.status === "budgetLimited" || goal?.status === "usageLimited") {
@@ -1070,6 +1139,7 @@ type GoalServices = {
   consumeAutoTurnReset: (sessionID: string) => boolean
   initializeUsage?: (sessionID: string) => Promise<void>
   stopAutonomy?: (sessionID: string, mode?: "stop" | "replace") => void
+  consumeObjectiveEdit?: (sessionID: string, objective: string) => { goalID: string; objective: string } | undefined
 }
 
 function boundedGoalTextSchema(limit: number, description: string, validate: (value: string) => string) {
@@ -1220,6 +1290,7 @@ async function updateGoalObjectiveFromTool(
     agent: typeof context.agent === "string" ? context.agent : null,
     planModePause: planningOnly,
     maxObjectiveChars: services.maxObjectiveChars,
+    requestedPlanEdit: services.consumeObjectiveEdit?.(context.sessionID, input.objective),
   })
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: services.messages.notices.planModeCreate } : { goal }, null, 2)
 }
@@ -1367,6 +1438,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   // and dispose.
   const toolAttempts = new Map<string, string | null>()
   const explicitResumeRequests = new Set<string>()
+  const objectiveEdits = new Map<string, { goalID: string; objective: string }>()
   const restartAfterContinuation = new Set<string>()
   const continuationEpochs = new ContinuationEpochs()
   // Sessions whose busy episode already received a watchdog rescue. Cleared
@@ -1382,6 +1454,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
     isPlanAgent,
     maxObjectiveChars: objectiveChars,
     consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
+    consumeObjectiveEdit: (sessionID, objective) => {
+      const edit = objectiveEdits.get(sessionID)
+      if (edit?.objective !== objective.trim()) return
+      objectiveEdits.delete(sessionID)
+      return edit
+    },
     stopAutonomy: (sessionID, mode = "stop") => {
       continuationEpochs.invalidate(sessionID)
       cancelScheduledContinuation(sessionID)
@@ -1769,6 +1847,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       nativeRetrySessions.clear()
       toolAttempts.clear()
       explicitResumeRequests.clear()
+    objectiveEdits.clear()
     },
     async config(config) {
       if (!registerCommand) return
@@ -1851,6 +1930,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
           return updateGoalObjectiveFromTool(args as { objective: string; status?: "active" | "paused" }, context, goalServices)
         },
       },
+      update_goal_plan: {
+        description: locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
+        args: planToolArgs,
+        execute: planFromTool,
+      },
       update_goal: {
         description:
           messages.tools.updateGoal,
@@ -1922,6 +2006,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async "command.execute.before"(input, output) {
       if (input.command === commandName) {
         const sanitized = escapeGoalCommandArguments(output, goalCommandTemplate(commandName, locale), input.arguments)
+        objectiveEdits.delete(input.sessionID)
+        const edit = /^edit\s+([\s\S]+)$/i.exec(input.arguments.trim())
+        const goal = edit && sanitized ? await getGoal(input.sessionID) : null
+        if (goal && edit) objectiveEdits.set(input.sessionID, { goalID: goal.id, objective: edit[1]!.trim() })
         if (sanitized && input.arguments.trim().toLowerCase() === "resume") {
           explicitResumeRequests.add(input.sessionID)
         }
@@ -1948,6 +2036,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
       if (attemptKey) toolAttempts.delete(attemptKey)
       if (!sessionID) return
+      if (GOAL_PLAN_TOOLS.has(input.tool)) {
+        const goal = await getGoal(sessionID)
+        if (goal || input.tool === "clear_goal") output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) }
+      }
       if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
       const toolResult = output as { output?: unknown; error?: unknown }
       // A successful tool output is real progress: it resolves any pending
@@ -2171,6 +2263,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   // delayed tool output cannot clear a newer pending attempt.
   const toolAttempts = new Map<string, string | null>()
   const explicitResumeRequests = new Set<string>()
+  const objectiveEdits = new Map<string, { goalID: string; objective: string }>()
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const activeContinuationsV2 = new Set<string>()
@@ -2190,6 +2283,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     maxObjectiveChars: objectiveChars,
     isPlanAgent,
     consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
+    consumeObjectiveEdit: (sessionID, objective) => {
+      const edit = objectiveEdits.get(sessionID)
+      if (edit?.objective !== objective.trim()) return
+      objectiveEdits.delete(sessionID)
+      return edit
+    },
     initializeUsage: async (sessionID) => {
       try {
         await accountUsage(sessionID, stepTokenSums.get(sessionID) ?? 0, { cumulative: true, source: "v2.steps" })
@@ -2938,6 +3037,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             description: command.description,
             execute: async (input, execution?: { signal?: AbortSignal }) => {
               // Command execution is routed to the session's owning location.
+              objectiveEdits.delete(input.sessionID)
+              const edit = command.action === "goal" ? /^edit\s+([\s\S]+)$/i.exec(input.prompt.text.trim()) : null
+              const editedGoal = edit ? await getGoal(input.sessionID) : null
+              if (editedGoal && edit) objectiveEdits.set(input.sessionID, { goalID: editedGoal.id, objective: edit[1]!.trim() })
               markSessionOwnership(input.sessionID, true)
               if (command.action === "pause") {
                 const goal = await getGoal(input.sessionID)
@@ -3097,6 +3200,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
       if (attemptKey) toolAttempts.delete(attemptKey)
       if (input.status !== "completed") return
+      if (sessionID && GOAL_PLAN_TOOLS.has(input.tool)) {
+        const goal = await getGoal(sessionID)
+        if (goal || input.tool === "clear_goal") input.result = { ...input.result, metadata: { ...input.result.metadata, ...acpPlanMetadata(goal) } }
+      }
       const text = textFromToolResult(input.result)
       taskTracker.noteTaskOutput(
         { tool: input.tool, sessionID: input.sessionID, callID: input.id },
@@ -3217,6 +3324,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     watchdogRescuedSessions.clear()
     toolAttempts.clear()
     explicitResumeRequests.clear()
+    objectiveEdits.clear()
     for (const registration of registrations) await registration.dispose()
     // Best-effort termination of the event consumer. Never block plugin
     // unload on a stream that does not close promptly.
@@ -3228,6 +3336,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 function goalToolsV2(services: GoalServices): ToolV2Info[] {
   const messages = services.messages
   return [
+    {
+      name: "update_goal_plan",
+      description: services.locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
+      input: v2ObjectSchema(planToolArgs),
+      options: { codemode: false },
+      execute: async (args, context) => ({ content: await planFromTool(args, context) }),
+    },
     {
       name: "get_goal",
       description:

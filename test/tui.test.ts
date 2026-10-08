@@ -281,19 +281,16 @@ test("V1 sidebar refreshes persisted counters without another goal tool result",
   }
 })
 
-test("sidebar reader accepts planless V3 snapshots and keeps rejecting planning and future formats", async () => {
+test("sidebar reader accepts V3 goals with plans while rejecting unknown future formats", async () => {
   const stored = { ...goal(), plan: null, planRevision: 0 }
   await writeGoalState({ version: 3, goals: { session: stored }, archives: {} })
-  expect(await readPersistedGoal("session")).toMatchObject({ objective: "test goal", plan: null, planRevision: 0 })
+  expect(await readPersistedGoal("session")).toMatchObject({ objective: "test goal" })
   expect(await readPersistedGoal("missing")).toBeNull()
-  for (const state of [
-    { version: 3, goals: { session: { ...stored, plan: { phases: [] } } } },
-    { version: 3, goals: { session: { ...stored, planRevision: 1 } } },
-    { version: 4, goals: { session: stored } },
-  ]) {
-    await writeGoalState(state)
-    expect(await readPersistedGoal("session")).toBeUndefined()
-  }
+  const planned = { ...stored, plan: { phases: [{ id: "parser", status: "in_progress" }] }, planRevision: 2 }
+  await writeGoalState({ version: 3, goals: { session: planned } })
+  expect(await readPersistedGoal("session")).toMatchObject({ objective: "test goal", planRevision: 2 })
+  await writeGoalState({ version: 4, goals: { session: planned } })
+  expect(await readPersistedGoal("session")).toBeUndefined()
 })
 
 test("formats goal durations for display", () => {
