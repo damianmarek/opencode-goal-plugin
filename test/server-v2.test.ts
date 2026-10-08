@@ -16,6 +16,7 @@ const TOOL_NAMES = [
   "stop_goal",
   "update_goal",
   "update_goal_objective",
+  "update_goal_plan",
   "update_goal_status",
 ].sort()
 
@@ -619,6 +620,55 @@ test("V2 control commands and disabled auto-continuation return after their exec
       .execute({ sessionID: "ses_v2", prompt: { text }, delivery: "steer" })
     expect(waits).toBe(text === "history" ? 0 : 1)
   }
+})
+
+test("V2 plan tools publish structured ACP metadata and compaction retains the plan", async () => {
+  const mock = makeMockContext()
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "production readiness")
+  const goal = (await getGoal("ses_v2"))!
+  const result = await goalTool(mock, "update_goal_plan").execute(
+    {
+      goal_id: goal.id,
+      expected_revision: 0,
+      reason: "Plan the full scope",
+      plan: {
+        summary: "Production readiness",
+        completionCriteria: ["Parser and execution verified"],
+        phases: [
+          {
+            id: "parser",
+            objective: "Parser correctness",
+            status: "in_progress",
+            tasks: [{ id: "compound", description: "Fix compound queries", status: "in_progress" }],
+          },
+        ],
+        decisions: [],
+      },
+    },
+    toolContext(),
+  )
+  const event = { tool: "update_goal_plan", sessionID: "ses_v2", id: "call_plan", status: "completed", result }
+  await mock.hooks["execute.after"]?.(event)
+  expect(event.result).toMatchObject({
+    metadata: {
+      acp: {
+        plan: {
+          entries: [{ content: "Parser correctness: Fix compound queries", status: "in_progress", priority: "medium" }],
+          _meta: {
+            "opencode-goal": {
+              objective: "production readiness",
+              status: "active",
+              progress: { currentTaskID: "compound" },
+            },
+          },
+        },
+      },
+    },
+  })
+  const compaction = { sessionID: "ses_v2", system: [], messages: [] }
+  await mock.hooks.compaction?.(compaction)
+  expect(JSON.stringify(compaction)).toContain("compound")
 })
 
 test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {
@@ -2491,6 +2541,47 @@ test("V2 wait failure pauses the goal and returns without hidden autonomous cont
     .execute({ sessionID: "ses_v2", prompt: { text: "Wait failure" }, delivery: "steer" })
   expect((await getGoal("ses_v2"))?.status).toBe("paused")
   expect(mock.promptCalls).toHaveLength(1)
+})
+
+test("V2 planned scope edits need a matching explicit command and consume the grant once", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "Original full goal")
+  const goal = (await getGoal("ses_v2"))!
+  const plan = {
+    summary: "Full scope",
+    completionCriteria: ["Parser and execution verified"],
+    phases: [
+      {
+        id: "parser",
+        objective: "Parser",
+        status: "pending",
+        tasks: [{ id: "parse", description: "Parse", status: "pending" }],
+      },
+    ],
+  }
+  await goalTool(mock, "update_goal_plan").execute(
+    { goal_id: goal.id, expected_revision: 0, plan, reason: "Preserve scope" },
+    toolContext(),
+  )
+  await expect(
+    goalTool(mock, "update_goal_objective").execute({ objective: "Only parser" }, toolContext()),
+  ).rejects.toThrow("/goal edit")
+  await mock.commands
+    .find((command) => command.name === "goal")!
+    .execute({ sessionID: "ses_v2", prompt: { text: "edit New user scope & <checks>" }, delivery: "steer" })
+  await expect(
+    goalTool(mock, "update_goal_objective").execute({ objective: "Different unrequested scope" }, toolContext()),
+  ).rejects.toThrow("/goal edit")
+  await goalTool(mock, "update_goal_objective").execute({ objective: "New user scope &amp; &lt;checks&gt;" }, toolContext())
+  expect(await getGoal("ses_v2")).toMatchObject({ objective: "New user scope & <checks>", plan: null, planRevision: 2 })
+  await goalTool(mock, "update_goal_plan").execute(
+    { goal_id: goal.id, expected_revision: 2, plan, reason: "Plan the new scope" },
+    toolContext(),
+  )
+  await expect(
+    goalTool(mock, "update_goal_objective").execute({ objective: "Original full goal" }, toolContext()),
+  ).rejects.toThrow("/goal edit")
 })
 
 for (const report of ["status", "show", "current"]) {
