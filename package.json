@@ -29,6 +29,9 @@
   "author": "Prevalentware",
   "type": "module",
   "exports": {
+    ".": {
+      "import": "./dist/server.js"
+    },
     "./server": {
       "import": "./dist/server.js"
     },
