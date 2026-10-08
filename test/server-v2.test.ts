@@ -1807,6 +1807,7 @@ test("V2 cleanup disposes registrations and stops the event consumer", async () 
     expect.arrayContaining([
       "command.transform",
       "session.hook:prompt",
+      "session.hook:interrupt",
       "tool.transform",
       "tool.hook:execute.before",
       "tool.hook:execute.after",
@@ -2465,6 +2466,7 @@ test("V2 command cancellation between idle cycles persists cancellation and stop
       { signal: controller.signal },
     )
   await waitFor(() => waits > 0)
+  await mock.hooks.interrupt!({ sessionID: "ses_v2" })
   controller.abort()
   await command
   expect((await getGoal("ses_v2"))?.status).toBe("cancelled")
@@ -2523,4 +2525,18 @@ test("V2 a stopped event stream pauses a waiting goal rather than polling foreve
     .find((command) => command.name === "goal")!
     .execute({ sessionID: "ses_v2", prompt: { text: "Continue the goal" }, delivery: "steer" })
   expect((await getGoal("ses_v2"))?.status).toBe("paused")
+})
+
+test("V2 a command transport abort preserves the active goal for reconnection", async () => {
+  const mock = makeMockContext()
+  let waits = 0
+  const context = { ...mock, session: { ...mock.session, wait: async () => { waits++ } } }
+  await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "Preserve scope after disconnect")
+  const controller = new AbortController()
+  const command = mock.commands.find((command) => command.name === "goal")!.execute({ sessionID: "ses_v2", prompt: { text: "Preserve scope after disconnect" }, delivery: "steer" }, { signal: controller.signal })
+  await waitFor(() => waits > 0)
+  controller.abort()
+  await command
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
 })

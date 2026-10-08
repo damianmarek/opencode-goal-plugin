@@ -2969,13 +2969,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                 ? AbortSignal.any([abortController.signal, execution.signal])
                 : abortController.signal
               let admitted = false
-              let cancellation: Promise<unknown> | undefined
               const cancel = () => {
                 if (!pursue || disposed) return
                 goalServices.stopAutonomy?.(input.sessionID)
-                cancellation = cancelActiveGoal(input.sessionID).catch((error) =>
-                  v2ErrorLog("Failed to persist command cancellation", error),
-                )
+                // Transport disposal stops local autonomy without closing the goal.
               }
               execution?.signal?.addEventListener("abort", cancel, { once: true })
               try {
@@ -3024,7 +3021,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                 }
               } finally {
                 execution?.signal?.removeEventListener("abort", cancel)
-                await cancellation
               }
             },
           })
@@ -3067,6 +3063,26 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
       }),
     )
+  }
+
+  // New hosts notify explicit user interruption even between execution cycles.
+  // Older hosts retain their execution-interrupted event handling.
+  try {
+    const hookInterrupt = context.session.hook as (
+      name: "interrupt",
+      callback: (event: { sessionID: string }) => Promise<void>,
+    ) => Promise<{ dispose(): Promise<void> }>
+    registrations.push(await hookInterrupt("interrupt", async ({ sessionID }) => {
+      markSessionOwnership(sessionID, true)
+      goalServices.stopAutonomy?.(sessionID)
+      try {
+        await cancelActiveGoal(sessionID)
+      } catch (error) {
+        v2ErrorLog("Failed to persist explicit session cancellation", error)
+      }
+    }))
+  } catch {
+    // Host predates the explicit session interruption hook.
   }
 
   registrations.push(
