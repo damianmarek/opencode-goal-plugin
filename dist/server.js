@@ -179,6 +179,8 @@ var GoalSchema = Schema.Struct({
   id: Schema.optionalWith(Schema.String, { default: () => "" }),
   sessionID: Schema.String,
   objective: Schema.String,
+  plan: Schema.optional(Schema.Null),
+  planRevision: Schema.optional(Schema.Literal(0)),
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
@@ -216,6 +218,8 @@ var ArchivedGoalSchema = Schema.Struct({
   id: Schema.String,
   sessionID: Schema.String,
   objective: Schema.String,
+  plan: Schema.optional(Schema.Null),
+  planRevision: Schema.optional(Schema.Literal(0)),
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
@@ -234,7 +238,7 @@ var LegacyStateSchema = Schema.Struct({
   goals: Schema.Record({ key: Schema.String, value: GoalSchema })
 });
 var StateSchema = Schema.Struct({
-  version: Schema.Literal(2),
+  version: Schema.Literal(2, 3),
   goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
   archives: Schema.optionalWith(Schema.Record({ key: Schema.String, value: Schema.Array(ArchivedGoalSchema) }), {
     default: () => ({})
@@ -551,6 +555,8 @@ function snapshot(goal) {
     id: goal.id,
     sessionID: goal.sessionID,
     objective: goal.objective,
+    ...goal.plan === null ? { plan: null } : {},
+    ...goal.planRevision === 0 ? { planRevision: 0 } : {},
     status: goal.status,
     tokenBudget: goal.tokenBudget,
     tokensUsed: goal.tokensUsed,
@@ -678,6 +684,8 @@ function archivedGoal(goal) {
     id: goal.id,
     sessionID: goal.sessionID,
     objective: summarizeText(goal.objective, MAX_ARCHIVED_OBJECTIVE_CHARS),
+    ...goal.plan === null ? { plan: null } : {},
+    ...goal.planRevision === 0 ? { planRevision: 0 } : {},
     status: goal.status,
     tokenBudget: goal.tokenBudget,
     tokensUsed: goal.tokensUsed,

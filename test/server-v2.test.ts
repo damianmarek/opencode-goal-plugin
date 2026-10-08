@@ -285,6 +285,28 @@ test("default export exposes both V1 server and V2 setup", () => {
   expect(plugin.id).toBe("local.goal-mode.server")
 })
 
+test("V2 ordinary tool hooks work when another session wrote planless version 3 state", async () => {
+  await createGoal("ses_existing", "preserve the other session", null)
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const state = JSON.parse(await readFile(file, "utf8"))
+  state.version = 3
+  state.goals.ses_existing.plan = null
+  state.goals.ses_existing.planRevision = 0
+  const content = JSON.stringify(state)
+  await writeFile(file, content, "utf8")
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+
+  for (const tool of ["read", "glob", "shell"]) {
+    await mock.hooks["execute.before"]!({ sessionID: "ses_new", id: `call_${tool}`, tool })
+    await mock.hooks["execute.after"]!({
+      sessionID: "ses_new", id: `call_${tool}`, tool, status: "completed", result: { content: `${tool} succeeded` },
+    })
+  }
+  expect(await readFile(file, "utf8")).toBe(content)
+  expect(await getGoal("ses_existing")).toMatchObject({ objective: "preserve the other session", plan: null, planRevision: 0 })
+})
+
 test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and {content} executors", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)

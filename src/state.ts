@@ -86,6 +86,9 @@ export type Goal = {
   id: string
   sessionID: string
   objective: string
+  // Preserve empty V3 planning metadata without importing unfinished planning semantics.
+  plan?: null
+  planRevision?: 0
   status: GoalStatus
   tokenBudget: number | null
   tokensUsed: number
@@ -129,7 +132,7 @@ type UsageTracker = {
 }
 
 type State = {
-  version: 2
+  version: 2 | 3
   goals: Record<string, Goal>
   archives: Record<string, ArchivedGoal[]>
 }
@@ -139,6 +142,8 @@ export type ArchivedGoal = Pick<
   | "id"
   | "sessionID"
   | "objective"
+  | "plan"
+  | "planRevision"
   | "status"
   | "tokenBudget"
   | "tokensUsed"
@@ -224,6 +229,8 @@ const GoalSchema = Schema.Struct({
   id: Schema.optionalWith(Schema.String, { default: () => "" }),
   sessionID: Schema.String,
   objective: Schema.String,
+  plan: Schema.optional(Schema.Null),
+  planRevision: Schema.optional(Schema.Literal(0)),
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
@@ -261,6 +268,8 @@ const ArchivedGoalSchema = Schema.Struct({
   id: Schema.String,
   sessionID: Schema.String,
   objective: Schema.String,
+  plan: Schema.optional(Schema.Null),
+  planRevision: Schema.optional(Schema.Literal(0)),
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
@@ -279,7 +288,7 @@ const LegacyStateSchema = Schema.Struct({
   goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
 })
 const StateSchema = Schema.Struct({
-  version: Schema.Literal(2),
+  version: Schema.Literal(2, 3),
   goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
   archives: Schema.optionalWith(Schema.Record({ key: Schema.String, value: Schema.Array(ArchivedGoalSchema) }), {
     default: () => ({}),
@@ -742,6 +751,8 @@ export function snapshot(goal: Goal): GoalSnapshot {
     id: goal.id,
     sessionID: goal.sessionID,
     objective: goal.objective,
+    ...(goal.plan === null ? { plan: null } : {}),
+    ...(goal.planRevision === 0 ? { planRevision: 0 as const } : {}),
     status: goal.status,
     tokenBudget: goal.tokenBudget,
     tokensUsed: goal.tokensUsed,
@@ -890,6 +901,8 @@ function archivedGoal(goal: Goal): ArchivedGoal {
     id: goal.id,
     sessionID: goal.sessionID,
     objective: summarizeText(goal.objective, MAX_ARCHIVED_OBJECTIVE_CHARS),
+    ...(goal.plan === null ? { plan: null } : {}),
+    ...(goal.planRevision === 0 ? { planRevision: 0 as const } : {}),
     status: goal.status,
     tokenBudget: goal.tokenBudget,
     tokensUsed: goal.tokensUsed,

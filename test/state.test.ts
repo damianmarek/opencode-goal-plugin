@@ -133,6 +133,44 @@ test("archives compact goal state and writes version 2 after migrating version 1
   expect(String(normalized.archives.ses_1?.[0]?.completionEvidence).length).toBeLessThanOrEqual(2_000)
 })
 
+test("reads and updates planless version 3 state without downgrading or losing metadata", async () => {
+  await createGoal("ses_1", "preserve the existing objective", 100)
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const state = JSON.parse(await readFile(file, "utf8"))
+  state.version = 3
+  state.goals.ses_1.plan = null
+  state.goals.ses_1.planRevision = 0
+  await writeFile(file, JSON.stringify(state), "utf8")
+
+  expect(await getGoal("ses_1")).toMatchObject({ objective: "preserve the existing objective", plan: null, planRevision: 0 })
+  expect(getGoalSync("ses_1")).toMatchObject({ plan: null, planRevision: 0 })
+  await accountUsage("ses_1", 20)
+  await setGoalStatus("ses_1", "paused")
+  const updated = JSON.parse(await readFile(file, "utf8"))
+  expect(updated.version).toBe(3)
+  expect(updated.goals.ses_1).toMatchObject({ plan: null, planRevision: 0, tokensUsed: 20, status: "paused" })
+
+  await clearGoal("ses_1")
+  expect((await getGoalHistory("ses_1")).previous[0]).toMatchObject({ plan: null, planRevision: 0 })
+  expect(JSON.parse(await readFile(file, "utf8")).version).toBe(3)
+})
+
+test("does not reinterpret populated planning state or unknown future state versions", async () => {
+  await createGoal("ses_1", "preserve planning state", null)
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const original = JSON.parse(await readFile(file, "utf8"))
+  for (const incompatible of [
+    { ...original, version: 3, goals: { ses_1: { ...original.goals.ses_1, plan: { phases: [] }, planRevision: 1 } } },
+    { ...original, version: 4 },
+  ]) {
+    const content = JSON.stringify(incompatible)
+    await writeFile(file, content, "utf8")
+    await expect(accountUsage("ses_1", 1)).rejects.toThrow()
+    expect(await readFile(file, "utf8")).toBe(content)
+    expect((await readdir(dir)).filter((name) => name.includes(".corrupt-"))).toEqual([])
+  }
+})
+
 test("status transitions are idempotent and cannot reopen closed goals", async () => {
   await createGoal("ses_1", "ship safely", null)
   const active = await getGoal("ses_1")
