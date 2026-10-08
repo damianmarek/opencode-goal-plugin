@@ -5,6 +5,7 @@ import { dirname } from "node:path"
 import { Data, Effect, Schema } from "effect-goal-state"
 import { atomicWriteFile } from "./atomic-write"
 import { statePath } from "./state-path"
+import { GoalPlanSchema, goalPlanProgress, reviseGoalPlan, type GoalPlan, type GoalPlanInput } from "./goal-plan"
 
 export { statePath } from "./state-path"
 
@@ -86,9 +87,8 @@ export type Goal = {
   id: string
   sessionID: string
   objective: string
-  // Preserve empty V3 planning metadata without importing unfinished planning semantics.
-  plan?: null
-  planRevision?: 0
+  plan: GoalPlan | null
+  planRevision: number
   status: GoalStatus
   tokenBudget: number | null
   tokensUsed: number
@@ -132,7 +132,7 @@ type UsageTracker = {
 }
 
 type State = {
-  version: 2 | 3
+  version: 3
   goals: Record<string, Goal>
   archives: Record<string, ArchivedGoal[]>
 }
@@ -225,12 +225,13 @@ const UsageTrackerSchema = Schema.Struct({
   pendingBaseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
   pendingBaseTokens: Schema.optionalWith(Schema.Unknown, { default: () => null }),
 })
+const PlanSchema = Schema.declare((value: unknown): value is GoalPlan => GoalPlanSchema.safeParse(value).success)
 const GoalSchema = Schema.Struct({
   id: Schema.optionalWith(Schema.String, { default: () => "" }),
   sessionID: Schema.String,
   objective: Schema.String,
-  plan: Schema.optional(Schema.Null),
-  planRevision: Schema.optional(Schema.Literal(0)),
+  plan: Schema.optionalWith(Schema.NullOr(PlanSchema), { default: () => null }),
+  planRevision: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
@@ -268,8 +269,8 @@ const ArchivedGoalSchema = Schema.Struct({
   id: Schema.String,
   sessionID: Schema.String,
   objective: Schema.String,
-  plan: Schema.optional(Schema.Null),
-  planRevision: Schema.optional(Schema.Literal(0)),
+  plan: Schema.optionalWith(Schema.NullOr(PlanSchema), { default: () => null }),
+  planRevision: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
@@ -305,6 +306,7 @@ export type GoalSnapshot = Omit<
 > & {
   remainingTokens: number | null
   sampledAt: number
+  planProgress: ReturnType<typeof goalPlanProgress> | null
   autoTurns: number
   lastContinuationAt: number | null
 }
@@ -336,7 +338,7 @@ function nowSeconds() {
 }
 
 function emptyState(): State {
-  return { version: 2, goals: {}, archives: {} }
+  return { version: 3, goals: {}, archives: {} }
 }
 
 function isMissingStateFile(error: unknown) {
@@ -345,7 +347,7 @@ function isMissingStateFile(error: unknown) {
 
 function mutableState(state: Schema.Schema.Type<typeof PersistedStateSchema>): State {
   const value = JSON.parse(JSON.stringify(state)) as Schema.Schema.Type<typeof PersistedStateSchema>
-  return value.version === 1 ? { version: 2, goals: value.goals as Record<string, Goal>, archives: {} } : (value as State)
+  return { ...value, version: 3, archives: value.version === 1 ? {} : value.archives } as State
 }
 
 const warnedEmptyStatePaths = new Set<string>()
@@ -622,6 +624,8 @@ function normalizeArchivedGoal(goal: ArchivedGoal) {
 }
 
 function normalizeGoal(goal: Goal) {
+  goal.plan ??= null
+  goal.planRevision = nonNegativeInteger(goal.planRevision, goal.plan?.revision ?? 0)
   goal.id ||= `legacy:${goal.sessionID}:${goal.createdAt}`
   goal.history = (goal.history ?? []).slice(-MAX_HISTORY_ENTRIES)
   goal.checkpoints = (goal.checkpoints ?? []).slice(-MAX_CHECKPOINTS)
@@ -751,8 +755,9 @@ export function snapshot(goal: Goal): GoalSnapshot {
     id: goal.id,
     sessionID: goal.sessionID,
     objective: goal.objective,
-    ...(goal.plan === null ? { plan: null } : {}),
-    ...(goal.planRevision === 0 ? { planRevision: 0 as const } : {}),
+    plan: goal.plan,
+    planRevision: goal.planRevision,
+    planProgress: goal.plan ? goalPlanProgress(goal.plan) : null,
     status: goal.status,
     tokenBudget: goal.tokenBudget,
     tokensUsed: goal.tokensUsed,
@@ -858,6 +863,8 @@ function createGoalRecord(
     id: randomUUID(),
     sessionID,
     objective,
+    plan: null,
+    planRevision: 0,
     status: normalizedOptions.initialStatus,
     tokenBudget: normalizedOptions.tokenBudget,
     tokensUsed: 0,
@@ -901,8 +908,8 @@ function archivedGoal(goal: Goal): ArchivedGoal {
     id: goal.id,
     sessionID: goal.sessionID,
     objective: summarizeText(goal.objective, MAX_ARCHIVED_OBJECTIVE_CHARS),
-    ...(goal.plan === null ? { plan: null } : {}),
-    ...(goal.planRevision === 0 ? { planRevision: 0 as const } : {}),
+    plan: goal.plan,
+    planRevision: goal.planRevision,
     status: goal.status,
     tokenBudget: goal.tokenBudget,
     tokensUsed: goal.tokensUsed,
@@ -992,6 +999,10 @@ export async function updateGoalObjective(
     if (!goal) throw new Error("cannot update goal because this session has no goal")
     if (isClosed(goal.status)) throw new Error("cannot update goal objective because this goal is closed; replace it instead")
     accountWallClock(goal)
+    if (goal.objective !== value) {
+      goal.plan = null
+      goal.planRevision += 1
+    }
     goal.objective = value
     goal.status = planModePause ? "paused" : status
     goal.updatedAt = nowSeconds()
@@ -1101,6 +1112,9 @@ export async function closeGoal(
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
     if (isClosed(goal.status)) throw new Error("cannot close goal because this goal is already closed")
+    if (input.status === "complete" && goal.plan?.phases.some((phase) => phase.status !== "completed")) {
+      throw new Error("cannot complete the overall goal while planned phases still require work or verification")
+    }
     accountWallClock(goal)
     const now = nowSeconds()
     goal.status = input.status
@@ -1122,6 +1136,41 @@ export async function closeGoal(
     return snapshot(goal)
   })
 }
+
+export async function updateGoalPlan(
+  sessionID: string,
+  input: {
+    goalID: string
+    expectedRevision: number
+    plan: GoalPlanInput
+    reason: string
+    revisitEvidence?: string
+  },
+) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || goal.id !== input.goalID)
+      throw new Error("goal was replaced or removed; read get_goal before planning")
+    if (isClosed(goal.status)) throw new Error("cannot update a closed goal's plan")
+    if (goal.planRevision !== input.expectedRevision)
+      throw new Error("goal plan revision changed; read get_goal before updating it")
+    goal.plan = reviseGoalPlan(
+      goal.plan,
+      input.plan,
+      input.expectedRevision,
+      input.reason,
+      nowSeconds(),
+      input.revisitEvidence,
+      goal.planRevision,
+    )
+    goal.planRevision = goal.plan.revision
+    goal.updatedAt = nowSeconds()
+    pushHistory(goal, "updated", `Goal plan updated (revision ${goal.planRevision}): ${input.reason}`)
+    return snapshot(goal)
+  })
+}
+
+export { goalPlanProgress }
 
 export async function completeGoal(sessionID: string, evidence: string, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
   return closeGoal(sessionID, { status: "complete", evidence }, maxObjectiveChars)

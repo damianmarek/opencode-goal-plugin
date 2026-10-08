@@ -4,7 +4,7 @@ import { rename, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/solid"
-import plugin, { formatDuration, formatGoal, goalStateFromSession, liveTimeUsedSeconds, readPersistedGoal } from "../src/tui.ts"
+import plugin, { formatDuration, formatGoal, goalStateFromSession, liveTimeUsedSeconds } from "../src/tui.ts"
 import { messagesFor } from "../src/i18n"
 
 const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
@@ -278,21 +278,6 @@ test("V1 sidebar refreshes persisted counters without another goal tool result",
     expect(frame).toContain("build verified")
   } finally {
     setup.renderer.destroy()
-  }
-})
-
-test("sidebar reader accepts planless V3 snapshots and keeps rejecting planning and future formats", async () => {
-  const stored = { ...goal(), plan: null, planRevision: 0 }
-  await writeGoalState({ version: 3, goals: { session: stored }, archives: {} })
-  expect(await readPersistedGoal("session")).toMatchObject({ objective: "test goal", plan: null, planRevision: 0 })
-  expect(await readPersistedGoal("missing")).toBeNull()
-  for (const state of [
-    { version: 3, goals: { session: { ...stored, plan: { phases: [] } } } },
-    { version: 3, goals: { session: { ...stored, planRevision: 1 } } },
-    { version: 4, goals: { session: stored } },
-  ]) {
-    await writeGoalState(state)
-    expect(await readPersistedGoal("session")).toBeUndefined()
   }
 })
 

@@ -16,6 +16,7 @@ const TOOL_NAMES = [
   "stop_goal",
   "update_goal",
   "update_goal_objective",
+  "update_goal_plan",
   "update_goal_status",
 ].sort()
 
@@ -283,28 +284,6 @@ test("default export exposes both V1 server and V2 setup", () => {
   expect(typeof plugin.server).toBe("function")
   expect(typeof plugin.setup).toBe("function")
   expect(plugin.id).toBe("local.goal-mode.server")
-})
-
-test("V2 ordinary tool hooks work when another session wrote planless version 3 state", async () => {
-  await createGoal("ses_existing", "preserve the other session", null)
-  const file = process.env.OPENCODE_GOAL_STATE_PATH!
-  const state = JSON.parse(await readFile(file, "utf8"))
-  state.version = 3
-  state.goals.ses_existing.plan = null
-  state.goals.ses_existing.planRevision = 0
-  const content = JSON.stringify(state)
-  await writeFile(file, content, "utf8")
-  const mock = makeMockContext({ auto_continue: false })
-  await setupPlugin(mock as never)
-
-  for (const tool of ["read", "glob", "shell"]) {
-    await mock.hooks["execute.before"]!({ sessionID: "ses_new", id: `call_${tool}`, tool })
-    await mock.hooks["execute.after"]!({
-      sessionID: "ses_new", id: `call_${tool}`, tool, status: "completed", result: { content: `${tool} succeeded` },
-    })
-  }
-  expect(await readFile(file, "utf8")).toBe(content)
-  expect(await getGoal("ses_existing")).toMatchObject({ objective: "preserve the other session", plan: null, planRevision: 0 })
 })
 
 test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and {content} executors", async () => {
@@ -619,6 +598,55 @@ test("V2 control commands and disabled auto-continuation return after their exec
       .execute({ sessionID: "ses_v2", prompt: { text }, delivery: "steer" })
     expect(waits).toBe(text === "history" ? 0 : 1)
   }
+})
+
+test("V2 plan tools publish structured ACP metadata and compaction retains the plan", async () => {
+  const mock = makeMockContext()
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "production readiness")
+  const goal = (await getGoal("ses_v2"))!
+  const result = await goalTool(mock, "update_goal_plan").execute(
+    {
+      goal_id: goal.id,
+      expected_revision: 0,
+      reason: "Plan the full scope",
+      plan: {
+        summary: "Production readiness",
+        completionCriteria: ["Parser and execution verified"],
+        phases: [
+          {
+            id: "parser",
+            objective: "Parser correctness",
+            status: "in_progress",
+            tasks: [{ id: "compound", description: "Fix compound queries", status: "in_progress" }],
+          },
+        ],
+        decisions: [],
+      },
+    },
+    toolContext(),
+  )
+  const event = { tool: "update_goal_plan", sessionID: "ses_v2", id: "call_plan", status: "completed", result }
+  await mock.hooks["execute.after"]?.(event)
+  expect(event.result).toMatchObject({
+    metadata: {
+      acp: {
+        plan: {
+          entries: [{ content: "Parser correctness: Fix compound queries", status: "in_progress", priority: "medium" }],
+          _meta: {
+            "opencode-goal": {
+              objective: "production readiness",
+              status: "active",
+              progress: { currentTaskID: "compound" },
+            },
+          },
+        },
+      },
+    },
+  })
+  const compaction = { sessionID: "ses_v2", system: [], messages: [] }
+  await mock.hooks.compaction?.(compaction)
+  expect(JSON.stringify(compaction)).toContain("compound")
 })
 
 test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {

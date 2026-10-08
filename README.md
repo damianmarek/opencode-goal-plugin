@@ -18,7 +18,7 @@ The OpenCode Goal Plugin adds:
 
 - `/goal <objective>`, `/pause_goal`, and `/resume_goal` as OpenCode commands for TUI, desktop, web, and remote integrations that expose the server command catalog.
 - A sidebar goal indicator with status, elapsed time, and objective.
-- Agent tools: `get_goal`, `get_goal_history`, `list_all_goals`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal_status`, `update_goal`, `stop_goal`, `replace_goal`, and `clear_goal`.
+- Agent tools: `get_goal`, `get_goal_history`, `list_all_goals`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal_status`, `update_goal`, `stop_goal`, `replace_goal`, `update_goal_plan`, and `clear_goal`.
 - Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
 - Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
 - Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
@@ -259,8 +259,6 @@ Ordinary fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden po
 
 The plugin migrates version 1 state files to version 2 on the next write. Version 2 adds stable goal identities, the terminal `cancelled` status, and compact archives. Older plugin versions intentionally reject version 2 instead of silently dropping archived history on their next write; back up or isolate `OPENCODE_GOAL_STATE_PATH` before downgrading.
 
-Planless version 3 files from the planning development build are also compatible: empty `plan: null` and `planRevision: 0` metadata survives reads, updates, and archival, and writes retain version 3. This prevents an otherwise valid shared state file from breaking ordinary OpenCode tool calls in sessions without a goal. Populated plans, nonzero planning revisions, and unknown future versions remain rejected without rewriting the file; use the corresponding planning build or an isolated `OPENCODE_GOAL_STATE_PATH` for those files.
-
 If the rename succeeds but syncing the parent directory reports a genuine I/O error, the mutation reports a write failure even though the new valid state may already be present. This avoids claiming durability that the filesystem did not confirm.
 
 If a non-empty state file contains only whitespace, a UTF-8 BOM, or NUL bytes after an interrupted write, the next mutation preserves its exact contents beside the state file as `goals.json.corrupt-<timestamp>-<uuid>` before writing recovered state. If another process replaces the state during recovery, the mutation refuses to overwrite that newer content. If the quarantine copy itself cannot be created, the plugin reports the failure and continues recovery rather than making every prompt fail indefinitely. OpenCode 1 also records the quarantine outcome and path through its application log so the data-loss event remains discoverable.
@@ -328,5 +326,12 @@ Cancelling an active goal from an ACP client is durable when OpenCode emits the 
 
 Registered `/goal <objective>` and `/resume_goal` commands use the host's public session-wait API to remain pending across automatic continuations until the goal stops, completes, reaches a safety limit, or auto-continuation is disabled. Hosts without that API keep their previous admission behavior. The ACP adapter must also stream each execution owned by the command: an adapter that ends its event consumer after the first execution can still hide later work. Ordinary prompts retain their host-defined turn lifetime.
 
+### Persistent plans and ACP
+
+For multi-phase goals, `update_goal_plan` saves the overall completion criteria, phases, tasks, decisions, verification evidence, and a bounded revision history. Read `get_goal` first and send `goal_id`, `expected_revision`, `plan`, and a `reason`. The returned `planProgress` identifies the current task, next phase, and completed work. Concurrent or delayed updates to a replaced or edited goal are rejected.
+
+Marking a task completed requires evidence; completing a phase requires all its tasks and phase verification. Start the next phase only after verifying the current phase. Completed work cannot be removed, and reopening it requires `revisit_evidence`. Overall completion criteria stay fixed until the user changes the goal's objective or replaces the goal. A goal with an unfinished plan cannot be marked complete. Explicit objective edits clear the old plan and increment its revision. Existing state files migrate automatically; plan data survives compaction and is retained in goal history.
+
+Goal tools publish standard ACP plan entries in `metadata.acp.plan`, with richer goal state in its `_meta` field. An ACP host that projects this metadata can display task progress and replay it when reloading a conversation. This requires the corresponding OpenCode ACP adapter integration; a plugin update alone cannot change an older adapter's UI. Finishing a task or phase leaves the overall goal active.
 
 The Promise-based persistence layer uses Effect 3 under the private `effect-goal-state` npm alias. This keeps it separate from modern OpenCode's shared Effect 4 SDK runtime. It remains an external runtime dependency, and no private Effect values cross the plugin API.

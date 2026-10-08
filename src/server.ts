@@ -4,6 +4,7 @@ import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
 import type { SessionMessageInfo } from "@opencode/client"
 import { z } from "zod"
+import { GoalPlanInputSchema, goalPlanEntries } from "./goal-plan"
 import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
   accountUsage,
@@ -33,6 +34,7 @@ import {
   resolveMaxObjectiveChars,
   statePath,
   updateGoalObjective,
+  updateGoalPlan,
   validateEvidence,
   validateObjective,
 } from "./state"
@@ -1048,6 +1050,73 @@ function mergeSystemReminder(output: { system: string[] }, reminder: string) {
   output.system[0] = `${output.system[0]}\n\n${reminder}`
 }
 
+const planToolArgs = {
+  goal_id: z.string().min(1),
+  expected_revision: z.number().int().nonnegative(),
+  plan: GoalPlanInputSchema,
+  reason: z.string().trim().min(1).max(2000),
+  revisit_evidence: z.string().trim().min(1).max(2000).optional(),
+}
+const PlanToolSchema = z.object(planToolArgs).strict()
+
+async function planFromTool(args: unknown, context: ToolExecContext) {
+  const input = PlanToolSchema.parse(args)
+  return JSON.stringify(
+    {
+      goal: await updateGoalPlan(context.sessionID, {
+        goalID: input.goal_id,
+        expectedRevision: input.expected_revision,
+        plan: input.plan,
+        reason: input.reason,
+        revisitEvidence: input.revisit_evidence,
+      }),
+    },
+    null,
+    2,
+  )
+}
+
+function acpPlanMetadata(goal: GoalSnapshot | null) {
+  return {
+    acp: {
+      plan: {
+        entries: goal?.plan
+          ? goalPlanEntries(goal.plan).map((entry) => ({
+              ...entry,
+              status: goal.status !== "active" && entry.status === "in_progress" ? "pending" : entry.status,
+            }))
+          : [],
+        _meta: {
+          "opencode-goal": goal
+            ? {
+                id: goal.id,
+                objective: goal.objective,
+                status: goal.status,
+                plan: goal.plan,
+                progress: goal.planProgress,
+                blocker: goal.blocker,
+                completionEvidence: goal.completionEvidence,
+              }
+            : null,
+        },
+      },
+    },
+  }
+}
+
+const GOAL_PLAN_TOOLS = new Set([
+  "get_goal",
+  "create_goal",
+  "set_goal",
+  "update_goal",
+  "update_goal_plan",
+  "update_goal_status",
+  "update_goal_objective",
+  "stop_goal",
+  "replace_goal",
+  "clear_goal",
+])
+
 function getGoalToolResult(goal: GoalSnapshot | null, messages: GoalMessages = messagesFor("en")) {
   const result: { goal: GoalSnapshot | null; goal_mode_notice?: string } = { goal }
   if (goal?.status === "budgetLimited" || goal?.status === "usageLimited") {
@@ -1851,6 +1920,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
           return updateGoalObjectiveFromTool(args as { objective: string; status?: "active" | "paused" }, context, goalServices)
         },
       },
+      update_goal_plan: {
+        description: locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
+        args: planToolArgs,
+        execute: planFromTool,
+      },
       update_goal: {
         description:
           messages.tools.updateGoal,
@@ -1948,6 +2022,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
       if (attemptKey) toolAttempts.delete(attemptKey)
       if (!sessionID) return
+      if (GOAL_PLAN_TOOLS.has(input.tool)) {
+        const goal = await getGoal(sessionID)
+        if (goal || input.tool === "clear_goal") output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) }
+      }
       if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
       const toolResult = output as { output?: unknown; error?: unknown }
       // A successful tool output is real progress: it resolves any pending
@@ -3058,6 +3136,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
       if (attemptKey) toolAttempts.delete(attemptKey)
       if (input.status !== "completed") return
+      if (sessionID && GOAL_PLAN_TOOLS.has(input.tool)) {
+        const goal = await getGoal(sessionID)
+        if (goal || input.tool === "clear_goal") input.result = { ...input.result, metadata: { ...input.result.metadata, ...acpPlanMetadata(goal) } }
+      }
       const text = textFromToolResult(input.result)
       taskTracker.noteTaskOutput(
         { tool: input.tool, sessionID: input.sessionID, callID: input.id },
@@ -3187,6 +3269,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 function goalToolsV2(services: GoalServices): ToolV2Info[] {
   const messages = services.messages
   return [
+    {
+      name: "update_goal_plan",
+      description: services.locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
+      input: v2ObjectSchema(planToolArgs),
+      options: { codemode: false },
+      execute: async (args, context) => ({ content: await planFromTool(args, context) }),
+    },
     {
       name: "get_goal",
       description:
